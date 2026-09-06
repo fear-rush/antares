@@ -17,6 +17,7 @@ func (s *Server) commandDeps() commands.Deps {
 		Skills:  s.skills,
 		MCP:     s.mcp,
 		Reload:  s.applyReload,
+		Gateway: s.gateway,
 		Version: version.Version,
 		WebURL:  s.config().Server.PublicURL,
 	}

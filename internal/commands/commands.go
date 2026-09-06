@@ -67,9 +67,16 @@ type Deps struct {
 	Skills  *skills.Manager
 	MCP     *mcp.Manager
 	Reload  func() error
+	Gateway GatewayControls
 	Version string
 	// WebURL is the dashboard address, shown by /web.
 	WebURL string
+}
+
+// GatewayControls is the subset of the gateway manager chat commands need:
+// reconnect one or all adapters. Implemented by *gateway.Manager.
+type GatewayControls interface {
+	Restart(platform string) error
 }
 
 type handler func(ctx context.Context, d Deps, in Input) (Result, error)
@@ -131,6 +138,8 @@ func init() {
 	register(Spec{Name: "agents", Summary: "Show running sub-agents and tasks", Surfaces: anywhere}, cmdAgents)
 	register(Spec{Name: "tasks", Args: "[id]", Summary: "List background tasks or read one", Surfaces: anywhere}, cmdTasks)
 	register(Spec{Name: "verbose", Args: "[on|off]", Summary: "Toggle live tool activity in chat", Surfaces: anywhere}, cmdVerbose)
+	register(Spec{Name: "settings", Summary: "Show server config (secrets redacted)", Surfaces: anywhere}, cmdSettings)
+	register(Spec{Name: "restart", Args: "[gateway|agent]", Summary: "Restart the gateway or reload config", Surfaces: []Surface{SurfaceGateway}}, cmdRestart)
 	register(Spec{Name: "retry", Summary: "Resend the last message", Surfaces: anywhere, Client: true}, clientAction("retry"))
 	register(Spec{Name: "resume", Args: "<id>", Summary: "Resume a session by id", Surfaces: []Surface{SurfaceTUI, SurfaceWeb}, Client: true}, cmdResume)
 	register(Spec{Name: "compact", Summary: "Summarise this session now", Surfaces: anywhere}, cmdCompact)

@@ -239,6 +239,33 @@ func (m *Manager) Sync(platform string) error {
 	return nil
 }
 
+// Restart reconnects gateway adapters without killing the process: empty
+// restarts every running adapter, a name restarts one. Unknown names error
+// so a typo cannot silently do nothing.
+func (m *Manager) Restart(platform string) error {
+	if platform == "" {
+		m.mu.RLock()
+		names := make([]string, 0, len(m.adapters))
+		for n := range m.adapters {
+			names = append(names, n)
+		}
+		m.mu.RUnlock()
+		for _, n := range names {
+			if err := m.Sync(n); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	m.mu.RLock()
+	_, running := m.adapters[platform]
+	m.mu.RUnlock()
+	if !running {
+		return fmt.Errorf("platform %q is not connected", platform)
+	}
+	return m.Sync(platform)
+}
+
 // Stop shuts down one platform.
 func (m *Manager) Stop(name string) {
 	m.mu.Lock()

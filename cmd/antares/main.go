@@ -703,9 +703,16 @@ func (rt *runtimeServices) runGatewayCommand(ctx context.Context, kvKey, session
 	switch res.Action.Kind {
 	case "new", "clear":
 		// Forgetting the session id is what "start fresh" means here: the next
-		// message opens a new one.
+		// message opens a new one. Name the active model so the user knows
+		// what they are talking to after the reset.
 		_ = rt.db.DeleteKV(ctx, kvKey)
-		return "Started a fresh session.", nil
+		rt.mu.Lock()
+		model, provider := rt.cfg.Model.Default, rt.cfg.Model.Provider
+		rt.mu.Unlock()
+		if strings.TrimSpace(model) == "" {
+			model = "(unset)"
+		}
+		return fmt.Sprintf("Started a fresh session. Model `%s` on provider `%s`.", model, provider), nil
 	case "stop":
 		if sessionID != "" {
 			rt.agent.Interrupt(sessionID)
@@ -730,6 +737,7 @@ func (rt *runtimeServices) commandDeps() commands.Deps {
 		Skills:  rt.skills,
 		MCP:     rt.mcp,
 		Reload:  rt.reload,
+		Gateway: rt.gateway,
 		Version: version.Version,
 	}
 }

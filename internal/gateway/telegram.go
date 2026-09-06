@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -112,17 +113,35 @@ type tgChat struct {
 }
 
 type tgMessage struct {
-	MessageID int64   `json:"message_id"`
-	From      *tgUser `json:"from"`
-	Chat      tgChat  `json:"chat"`
-	Text      string  `json:"text"`
-	Caption   string  `json:"caption"`
-	Date      int64   `json:"date"`
+	MessageID   int64             `json:"message_id"`
+	From        *tgUser           `json:"from"`
+	Chat        tgChat            `json:"chat"`
+	Text        string            `json:"text"`
+	Caption     string            `json:"caption"`
+	Date        int64             `json:"date"`
+	ReplyMarkup *tgInlineKeyboard `json:"reply_markup,omitempty"`
+}
+
+type tgInlineKeyboard struct {
+	InlineKeyboard [][]tgInlineButton `json:"inline_keyboard"`
+}
+
+type tgInlineButton struct {
+	Text         string `json:"text"`
+	CallbackData string `json:"callback_data,omitempty"`
+}
+
+type tgCallbackQuery struct {
+	ID      string     `json:"id"`
+	From    *tgUser    `json:"from"`
+	Message *tgMessage `json:"message"`
+	Data    string     `json:"data"`
 }
 
 type tgUpdate struct {
-	UpdateID int64      `json:"update_id"`
-	Message  *tgMessage `json:"message"`
+	UpdateID      int64            `json:"update_id"`
+	Message       *tgMessage       `json:"message"`
+	CallbackQuery *tgCallbackQuery `json:"callback_query"`
 }
 
 // Start long-polls for updates until ctx is cancelled.
@@ -155,7 +174,7 @@ func (t *Telegram) Start(ctx context.Context) error {
 		var updates []tgUpdate
 		payload := map[string]any{
 			"timeout":         50,
-			"allowed_updates": []string{"message"},
+			"allowed_updates": []string{"message", "callback_query"},
 		}
 		if t.offset > 0 {
 			payload["offset"] = t.offset
@@ -170,6 +189,10 @@ func (t *Telegram) Start(ctx context.Context) error {
 		for _, u := range updates {
 			if u.UpdateID >= t.offset {
 				t.offset = u.UpdateID + 1
+			}
+			if u.CallbackQuery != nil {
+				go t.handleCallback(ctx, *u.CallbackQuery)
+				continue
 			}
 			if u.Message == nil || u.Message.From == nil || u.Message.From.IsBot {
 				continue
@@ -227,6 +250,13 @@ func (t *Telegram) handleMessage(ctx context.Context, m tgMessage) {
 		return
 	}
 
+	// Picker commands render inline buttons instead of plain text: /model and
+	// /provider without args list the configured choices as tappable buttons.
+	if kb, text, ok := t.pickerReply(ctx, msg, text); ok {
+		_, _ = t.SendKeyboard(ctx, Reply{ChannelID: chatID, Text: text, ReplyTo: msg.MessageID}, kb)
+		return
+	}
+
 	// React so the user sees work started instantly; the placeholder below is
 	// only the streaming surface, not the acknowledgement.
 	t.setReaction(ctx, chatID, msg.MessageID, "👀")
@@ -245,8 +275,8 @@ func (t *Telegram) handleMessage(ctx context.Context, m tgMessage) {
 				return
 			case <-ticker.C:
 				_ = t.sendChatAction(ctx, chatID, "typing")
+			}
 		}
-	}
 	}()
 
 	// A placeholder gives the user immediate feedback; it is edited as the
@@ -308,6 +338,195 @@ func (t *Telegram) handleMessage(ctx context.Context, m tgMessage) {
 	}
 }
 
+// pickerReply answers /model and /provider without args with an inline
+// keyboard of the configured choices. It reports false for anything else so
+// the caller falls through to the agent.
+func (t *Telegram) pickerReply(ctx context.Context, msg InboundMessage, text string) ([][]tgInlineButton, string, bool) {
+	name, args, ok := parseCommand(text)
+	if !ok || args != "" {
+		return nil, "", false
+	}
+	cfg := t.mgr.config()
+	switch strings.ToLower(name) {
+	case "model":
+		reply, err := t.mgr.handle(ctx, withText(msg, "/model "), nil)
+		if err != nil {
+			reply = "⚠️ " + err.Error()
+		}
+		return keyboardFor(cfg, "model"), reply, true
+	case "provider":
+		reply, err := t.mgr.handle(ctx, withText(msg, "/provider "), nil)
+		if err != nil {
+			reply = "⚠️ " + err.Error()
+		}
+		return keyboardFor(cfg, "provider"), reply, true
+	}
+	return nil, "", false
+}
+
+func parseCommand(text string) (name, args string, ok bool) {
+	text = strings.TrimSpace(text)
+	if !strings.HasPrefix(text, "/") || len(text) < 2 {
+		return "", "", false
+	}
+	name, args, _ = strings.Cut(strings.TrimPrefix(text, "/"), " ")
+	name, _, _ = strings.Cut(name, "@")
+	name = strings.ToLower(strings.TrimSpace(name))
+	if name == "" {
+		return "", "", false
+	}
+	return name, strings.TrimSpace(args), true
+}
+
+func withText(msg InboundMessage, text string) InboundMessage {
+	msg.Text = text
+	return msg
+}
+
+// handleCallback answers inline-keyboard taps. Only callbacks the bot itself
+// issued are honoured: model picks (model:<id>) and provider picks
+// (provider:<id>) are checked against the live config, everything else gets a
+// short toast and is ignored.
+func (t *Telegram) handleCallback(ctx context.Context, q tgCallbackQuery) {
+	answer := func(text string) {
+		_ = t.call(ctx, "answerCallbackQuery", map[string]any{
+			"callback_query_id": q.ID, "text": text,
+		}, nil)
+	}
+	if q.From == nil || q.From.IsBot || q.Message == nil {
+		answer("")
+		return
+	}
+	data := strings.TrimSpace(q.Data)
+	kind, value, _ := strings.Cut(data, ":")
+	chatID := strconv.FormatInt(q.Message.Chat.ID, 10)
+
+	msg := InboundMessage{
+		Platform: "telegram", ChannelID: chatID, UserID: strconv.FormatInt(q.From.ID, 10),
+		UserName:    firstNonEmpty(q.From.Username, q.From.FirstName),
+		DisplayName: firstNonEmpty(q.From.FirstName, q.From.Username),
+		Text:        "", IsDirect: q.Message.Chat.Type == "private",
+		MessageID: strconv.FormatInt(q.Message.MessageID, 10),
+	}
+	allowed, _ := t.mgr.authorize(ctx, msg, t.cfg.AllowedUsers, t.cfg.AllowedChats, msg.IsDirect && t.cfg.RequirePairing)
+	if !allowed {
+		answer("Not allowed.")
+		return
+	}
+	mid, _ := strconv.ParseInt(msg.MessageID, 10, 64)
+
+	removeKeyboard := func() {
+		_ = t.call(ctx, "editMessageReplyMarkup", map[string]any{
+			"chat_id": chatID, "message_id": mid,
+			"reply_markup": map[string]any{"inline_keyboard": []any{}},
+		}, nil)
+	}
+
+	var line, cmdName string
+	switch kind {
+	case "model":
+		if !validModelChoice(t.mgr.config(), value) {
+			answer("Unknown model.")
+			return
+		}
+		cmdName, line = "model", "/model "+value
+	case "provider":
+		if !validProviderChoice(t.mgr.config(), value) {
+			answer("Unknown provider.")
+			return
+		}
+		cmdName, line = "provider", "/provider "+value
+	default:
+		answer("That button is no longer active.")
+		return
+	}
+	reply, err := t.mgr.handle(ctx, InboundMessage{
+		Platform: msg.Platform, ChannelID: msg.ChannelID, UserID: msg.UserID,
+		UserName: msg.UserName, DisplayName: msg.DisplayName,
+		Text: line, IsDirect: msg.IsDirect,
+	}, nil)
+	if err != nil {
+		reply = "⚠️ " + err.Error()
+	}
+	removeKeyboard()
+	answer(cmdName + " set to " + value)
+	_, _ = t.Send(ctx, Reply{ChannelID: chatID, Text: reply})
+}
+
+// validModelChoice reports whether id is a configured model: the provider
+// list, fallbacks, auxiliary, or the current default. Kept in gateway (not
+// commands) to avoid an import cycle: commands never imports gateway.
+func validModelChoice(cfg *config.Config, id string) bool {
+	if cfg == nil || strings.TrimSpace(id) == "" {
+		return false
+	}
+	if id == cfg.Model.Default {
+		return true
+	}
+	seen := map[string]bool{}
+	var check []string
+	if p, ok := cfg.Providers[cfg.Model.Provider]; ok {
+		check = append(check, p.Models...)
+	}
+	check = append(check, cfg.Model.Fallback...)
+	if aux := strings.TrimSpace(cfg.Model.Auxiliary); aux != "" {
+		check = append(check, aux)
+	}
+	for _, c := range check {
+		if strings.TrimSpace(c) != "" {
+			seen[c] = true
+		}
+	}
+	return seen[id]
+}
+
+func validProviderChoice(cfg *config.Config, id string) bool {
+	if cfg == nil || strings.TrimSpace(id) == "" {
+		return false
+	}
+	_, ok := cfg.Providers[id]
+	return ok
+}
+
+// keyboardFor builds the inline keyboard for a picker action: "model" gives
+// one button per configured model, "provider" one per provider.
+func keyboardFor(cfg *config.Config, kind string) [][]tgInlineButton {
+	var items []string
+	switch kind {
+	case "provider":
+		for n := range cfg.Providers {
+			items = append(items, n)
+		}
+		sort.Strings(items)
+	default:
+		if p, ok := cfg.Providers[cfg.Model.Provider]; ok {
+			items = append(items, p.Models...)
+		}
+		items = append(items, cfg.Model.Fallback...)
+		if aux := strings.TrimSpace(cfg.Model.Auxiliary); aux != "" {
+			items = append(items, aux)
+		}
+	}
+	seen := map[string]bool{}
+	rows := make([][]tgInlineButton, 0, len(items))
+	for _, it := range items {
+		it = strings.TrimSpace(it)
+		if it == "" || seen[it] {
+			continue
+		}
+		seen[it] = true
+		if len(rows) >= 12 {
+			break
+		}
+		label := it
+		if (kind == "model" && it == cfg.Model.Default) || (kind == "provider" && it == cfg.Model.Provider) {
+			label = "● " + it
+		}
+		rows = append(rows, []tgInlineButton{{Text: label, CallbackData: kind + ":" + it}})
+	}
+	return rows
+}
+
 // builtinCommand handles slash commands that never reach the model.
 func (t *Telegram) builtinCommand(ctx context.Context, msg InboundMessage, text string) (string, bool) {
 	if !strings.HasPrefix(text, "/") {
@@ -357,8 +576,18 @@ func (t *Telegram) setReaction(ctx context.Context, chatID, messageID, emoji str
 	}, nil)
 }
 
-// Send posts or edits a message and returns its id.
+// Send posts or edits a message and returns its id. Use SendKeyboard for a
+// message with tappable inline buttons.
 func (t *Telegram) Send(ctx context.Context, r Reply) (string, error) {
+	return t.sendWithKeyboard(ctx, r, nil)
+}
+
+// SendKeyboard posts a message with an inline keyboard built by keyboardFor.
+func (t *Telegram) SendKeyboard(ctx context.Context, r Reply, keyboard [][]tgInlineButton) (string, error) {
+	return t.sendWithKeyboard(ctx, r, keyboard)
+}
+
+func (t *Telegram) sendWithKeyboard(ctx context.Context, r Reply, keyboard [][]tgInlineButton) (string, error) {
 	payload := map[string]any{
 		"chat_id":    r.ChannelID,
 		"text":       truncateTG(r.Text),
@@ -371,7 +600,27 @@ func (t *Telegram) Send(ctx context.Context, r Reply) (string, error) {
 	} else if r.ReplyTo != "" {
 		payload["reply_parameters"] = map[string]any{"message_id": r.ReplyTo, "allow_sending_without_reply": true}
 	}
-
+	if len(keyboard) > 0 {
+		rows := make([][]tgInlineButton, 0, len(keyboard))
+		for _, row := range keyboard {
+			if len(row) == 0 {
+				continue
+			}
+			btns := make([]tgInlineButton, 0, len(row))
+			for _, b := range row {
+				if strings.TrimSpace(b.Text) == "" || strings.TrimSpace(b.CallbackData) == "" {
+					continue
+				}
+				btns = append(btns, tgInlineButton{Text: b.Text, CallbackData: b.CallbackData})
+			}
+			if len(btns) > 0 {
+				rows = append(rows, btns)
+			}
+		}
+		if len(rows) > 0 {
+			payload["reply_markup"] = map[string]any{"inline_keyboard": rows}
+		}
+	}
 	var result tgMessage
 	err := t.call(ctx, method, payload, &result)
 	if err != nil && strings.Contains(err.Error(), "can't parse entities") {

@@ -42,6 +42,10 @@ type Spec struct {
 
 // Action is a machine-readable instruction for the calling surface, returned
 // alongside the human-readable output.
+// Action kinds the gateway understands: new/clear forget the session, stop
+// interrupts it, keyboard asks the adapter to attach an inline keyboard,
+// text-only is a plain reply. Value carries the callback prefix ("model",
+// "provider") for keyboard actions.
 type Action struct {
 	Kind  string `json:"kind,omitempty"`
 	Value string `json:"value,omitempty"`
@@ -124,6 +128,9 @@ func init() {
 	register(Spec{Name: "new", Summary: "Start a fresh session", Surfaces: anywhere, Client: true}, clientAction("new"))
 	register(Spec{Name: "clear", Summary: "Clear the transcript", Surfaces: anywhere, Client: true}, clientAction("clear"))
 	register(Spec{Name: "stop", Summary: "Interrupt the current turn", Surfaces: anywhere, Client: true}, cmdStop)
+	register(Spec{Name: "agents", Summary: "Show running sub-agents and tasks", Surfaces: anywhere}, cmdAgents)
+	register(Spec{Name: "tasks", Args: "[id]", Summary: "List background tasks or read one", Surfaces: anywhere}, cmdTasks)
+	register(Spec{Name: "verbose", Args: "[on|off]", Summary: "Toggle live tool activity in chat", Surfaces: anywhere}, cmdVerbose)
 	register(Spec{Name: "retry", Summary: "Resend the last message", Surfaces: anywhere, Client: true}, clientAction("retry"))
 	register(Spec{Name: "resume", Args: "<id>", Summary: "Resume a session by id", Surfaces: []Surface{SurfaceTUI, SurfaceWeb}, Client: true}, cmdResume)
 	register(Spec{Name: "compact", Summary: "Summarise this session now", Surfaces: anywhere}, cmdCompact)

@@ -283,8 +283,38 @@ func (m *bgManager) stop(id string) bool {
 	return ok
 }
 
-// BackgroundTasks lists every task for the swarm/status views.
+// BackgroundTask is a background task snapshot plus the delegating session,
+// so gateway commands can scope the list to one chat.
+type BackgroundTask struct {
+	tools.TaskInfo
+	ParentSession string
+}
+
+// BackgroundTasksFor lists every task for the swarm/status views.
 func (a *Agent) BackgroundTasks() []tools.TaskInfo { return a.bg.list("") }
+
+// BackgroundTasksScoped lists background tasks with their parent session.
+func (a *Agent) BackgroundTasksScoped() []BackgroundTask {
+	a.bg.mu.Lock()
+	defer a.bg.mu.Unlock()
+	out := make([]BackgroundTask, 0, len(a.bg.tasks))
+	for _, t := range a.bg.tasks {
+		out = append(out, BackgroundTask{TaskInfo: t.info, ParentSession: t.parentSession})
+	}
+	sortTasksByStartInfos(out)
+	return out
+}
+
+// BackgroundTask finds one task by id.
+func (a *Agent) BackgroundTask(id string) (BackgroundTask, bool) {
+	a.bg.mu.Lock()
+	defer a.bg.mu.Unlock()
+	t, ok := a.bg.tasks[id]
+	if !ok {
+		return BackgroundTask{}, false
+	}
+	return BackgroundTask{TaskInfo: t.info, ParentSession: t.parentSession}, true
+}
 
 func truncTask(s string) string {
 	s = strings.TrimSpace(strings.ReplaceAll(s, "\n", " "))
@@ -295,6 +325,14 @@ func truncTask(s string) string {
 }
 
 func sortTasksByStart(list []tools.TaskInfo) {
+	for i := 1; i < len(list); i++ {
+		for j := i; j > 0 && list[j].StartedAt.After(list[j-1].StartedAt); j-- {
+			list[j], list[j-1] = list[j-1], list[j]
+		}
+	}
+}
+
+func sortTasksByStartInfos(list []BackgroundTask) {
 	for i := 1; i < len(list); i++ {
 		for j := i; j > 0 && list[j].StartedAt.After(list[j-1].StartedAt); j-- {
 			list[j], list[j-1] = list[j-1], list[j]

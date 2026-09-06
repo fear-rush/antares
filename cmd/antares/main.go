@@ -437,9 +437,9 @@ func (rt *runtimeServices) handleGatewayMessage(ctx context.Context, msg gateway
 			}
 		case agent.EventToolCall:
 			// Surface tool activity on the gateway: a long task that only
-				// streams text looks dead while it reads files, runs shell
-				// commands, or fans out to sub-agents (delegate_task forwards
-				// "sub-agent: <tool>" progress via OnProgress).
+			// streams text looks dead while it reads files, runs shell
+			// commands, or fans out to sub-agents (delegate_task forwards
+			// "sub-agent: <tool>" progress via OnProgress).
 			if partial != nil {
 				partial(gatewayProgress(reply.String(), "🔧 "+e.Name))
 			}

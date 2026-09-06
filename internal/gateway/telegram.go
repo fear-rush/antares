@@ -227,7 +227,27 @@ func (t *Telegram) handleMessage(ctx context.Context, m tgMessage) {
 		return
 	}
 
+	// React so the user sees work started instantly; the placeholder below is
+	// only the streaming surface, not the acknowledgement.
+	t.setReaction(ctx, chatID, msg.MessageID, "👀")
 	_ = t.sendChatAction(ctx, chatID, "typing")
+
+	// Keep the typing indicator alive on long tasks: Telegram drops it after
+	// ~5s, which is why a slow agent looked dead.
+	typingDone := make(chan struct{})
+	defer close(typingDone)
+	go func() {
+		ticker := time.NewTicker(4 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-typingDone:
+				return
+			case <-ticker.C:
+				_ = t.sendChatAction(ctx, chatID, "typing")
+		}
+	}
+	}()
 
 	// A placeholder gives the user immediate feedback; it is edited as the
 	// answer streams in, then finalised.
@@ -256,9 +276,14 @@ func (t *Telegram) handleMessage(ctx context.Context, m tgMessage) {
 		_, _ = t.Send(ctx, Reply{ChannelID: chatID, Text: truncateTG(s) + " ▌", EditID: placeholderID})
 	}
 
-	reply, err := t.mgr.handle(ctx, msg, partial)
-	if err != nil {
-		reply = "⚠️ " + err.Error()
+	reply, runErr := t.mgr.handle(ctx, msg, partial)
+	if runErr != nil {
+		reply = "⚠️ " + runErr.Error()
+		t.setReaction(ctx, chatID, msg.MessageID, "❌")
+	} else if strings.TrimSpace(reply) != "" {
+		t.setReaction(ctx, chatID, msg.MessageID, "✅")
+	} else {
+		t.setReaction(ctx, chatID, msg.MessageID, "")
 	}
 	// An empty reply with no error is intentional silence (disallowed user,
 	// unregistered chat, relevance gate). Remove the placeholder and send
@@ -313,6 +338,23 @@ func (t *Telegram) builtinCommand(ctx context.Context, msg InboundMessage, text 
 
 func (t *Telegram) sendChatAction(ctx context.Context, chatID, action string) error {
 	return t.call(ctx, "sendChatAction", map[string]any{"chat_id": chatID, "action": action}, nil)
+}
+
+// setReaction puts an emoji reaction on a user message via setMessageReaction.
+// An empty emoji clears the bot's reaction. Failures are swallowed: a reaction
+// is feedback, never fatal to the reply.
+func (t *Telegram) setReaction(ctx context.Context, chatID, messageID, emoji string) {
+	mid, err := strconv.ParseInt(messageID, 10, 64)
+	if err != nil {
+		return
+	}
+	reaction := []map[string]string{}
+	if emoji != "" {
+		reaction = []map[string]string{{"type": "emoji", "emoji": emoji}}
+	}
+	_ = t.call(ctx, "setMessageReaction", map[string]any{
+		"chat_id": chatID, "message_id": mid, "reaction": reaction, "is_big": false,
+	}, nil)
 }
 
 // Send posts or edits a message and returns its id.

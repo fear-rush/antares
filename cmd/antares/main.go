@@ -325,6 +325,42 @@ func bootstrap(ctx context.Context) (*runtimeServices, error) {
 	return rt, nil
 }
 
+// gatewayProgress appends one short status line to the streamed text without
+// flooding the placeholder: only the latest status line is kept, capped at
+// 200 chars. Telegram's 1s edit throttle in the adapters stays the backstop.
+func gatewayProgress(answer, status string) string {
+	status = strings.TrimSpace(status)
+	if status == "" {
+		return answer
+	}
+	if len(status) > 200 {
+		status = status[:200] + "…"
+	}
+	base := strings.TrimSpace(answer)
+	if base == "" {
+		return status
+	}
+	lines := strings.Split(base, "\n")
+	kept := lines[:0]
+	for _, ln := range lines {
+		if strings.HasPrefix(ln, "🔧 ") || strings.HasPrefix(ln, "📌 ") {
+			continue
+		}
+		kept = append(kept, ln)
+	}
+	return strings.TrimSpace(strings.Join(kept, "\n")) + "\n\n" + status
+}
+
+// lastLine keeps only the final line of a progress message so multi-line tool
+// output never spills into the streaming status.
+func lastLine(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.LastIndex(s, "\n"); i >= 0 {
+		return strings.TrimSpace(s[i+1:])
+	}
+	return s
+}
+
 // handleGatewayMessage runs one platform message through the agent, reusing a
 // persistent session per channel so conversations stay continuous.
 func (rt *runtimeServices) handleGatewayMessage(ctx context.Context, msg gateway.InboundMessage, partial func(string)) (string, error) {
@@ -398,6 +434,22 @@ func (rt *runtimeServices) handleGatewayMessage(ctx context.Context, msg gateway
 			reply.WriteString(e.Delta)
 			if partial != nil {
 				partial(reply.String())
+			}
+		case agent.EventToolCall:
+			// Surface tool activity on the gateway: a long task that only
+				// streams text looks dead while it reads files, runs shell
+				// commands, or fans out to sub-agents (delegate_task forwards
+				// "sub-agent: <tool>" progress via OnProgress).
+			if partial != nil {
+				partial(gatewayProgress(reply.String(), "🔧 "+e.Name))
+			}
+		case agent.EventToolProgress:
+			if partial != nil && strings.TrimSpace(e.Message) != "" {
+				partial(gatewayProgress(reply.String(), "🔧 "+e.Name+": "+lastLine(e.Message)))
+			}
+		case agent.EventNotice:
+			if partial != nil && strings.TrimSpace(e.Message) != "" {
+				partial(gatewayProgress(reply.String(), "📌 "+lastLine(e.Message)))
 			}
 		}
 		return nil

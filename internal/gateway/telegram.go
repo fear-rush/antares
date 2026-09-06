@@ -299,11 +299,14 @@ func (t *Telegram) handleMessage(ctx context.Context, m tgMessage) {
 		mu.Lock()
 		defer mu.Unlock()
 		// Telegram rate-limits edits; one per second is comfortably safe.
-		if time.Since(lastEdit) < time.Second || s == lastText {
+		// Render through the same HTML path as the final send so the stream
+		// never shows raw Markdown the final message will restyle.
+		html := renderTelegram(s)
+		if time.Since(lastEdit) < time.Second || html == lastText {
 			return
 		}
-		lastEdit, lastText = time.Now(), s
-		_, _ = t.Send(ctx, Reply{ChannelID: chatID, Text: truncateTG(s) + " ▌", EditID: placeholderID})
+		lastEdit, lastText = time.Now(), html
+		_, _ = t.sendRendered(ctx, Reply{ChannelID: chatID, Text: truncateTG(s) + " ▌", EditID: placeholderID}, nil)
 	}
 
 	reply, runErr := t.mgr.handle(ctx, msg, partial)
@@ -325,14 +328,21 @@ func (t *Telegram) handleMessage(ctx context.Context, m tgMessage) {
 		return
 	}
 
-	for i, chunk := range splitForTelegram(reply) {
-		out := Reply{ChannelID: chatID, Text: chunk}
+	for i, chunk := range splitMarkdownSafe(reply, telegramLimit) {
 		if i == 0 && placeholderID != "" {
-			out.EditID = placeholderID
-		} else if i == 0 {
-			out.ReplyTo = msg.MessageID
+			// First chunk reuses the placeholder via edit; later chunks are
+			// new messages. editMessageText cannot switch to sendRichMessage,
+			// so the first chunk stays HTML; tables go native from chunk 2.
+			if _, err := t.sendRendered(ctx, Reply{ChannelID: chatID, Text: chunk, EditID: placeholderID}, nil); err != nil {
+				slog.Warn("telegram: send failed", "error", err)
+			}
+			continue
 		}
-		if _, err := t.Send(ctx, out); err != nil {
+		replyTo := ""
+		if i == 0 {
+			replyTo = msg.MessageID
+		}
+		if _, err := t.sendRich(ctx, chatID, chunk, replyTo); err != nil {
 			slog.Warn("telegram: send failed", "error", err)
 		}
 	}
@@ -588,10 +598,35 @@ func (t *Telegram) SendKeyboard(ctx context.Context, r Reply, keyboard [][]tgInl
 }
 
 func (t *Telegram) sendWithKeyboard(ctx context.Context, r Reply, keyboard [][]tgInlineButton) (string, error) {
+	return t.sendRendered(ctx, r, keyboard)
+}
+
+// sendRich posts one chunk via sendRichMessage with native table blocks when
+// the text has a pipe table, else falls back to sendMessage HTML.
+func (t *Telegram) sendRich(ctx context.Context, chatID, text, replyTo string) (string, error) {
+	if !useRichMessage(text) {
+		return t.sendRendered(ctx, Reply{ChannelID: chatID, Text: text, ReplyTo: replyTo}, nil)
+	}
+	payload := map[string]any{"chat_id": chatID, "rich_message": richTablePayload(text)}
+	if replyTo != "" {
+		payload["reply_parameters"] = map[string]any{"message_id": replyTo, "allow_sending_without_reply": true}
+	}
+	var result tgMessage
+	if err := t.call(ctx, "sendRichMessage", payload, &result); err != nil {
+		if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "Bad Request") {
+			return t.sendRendered(ctx, Reply{ChannelID: chatID, Text: text, ReplyTo: replyTo}, nil)
+		}
+		return "", err
+	}
+	return strconv.FormatInt(result.MessageID, 10), nil
+}
+
+func (t *Telegram) sendRendered(ctx context.Context, r Reply, keyboard [][]tgInlineButton) (string, error) {
+	html := renderTelegram(r.Text)
 	payload := map[string]any{
 		"chat_id":    r.ChannelID,
-		"text":       truncateTG(r.Text),
-		"parse_mode": "Markdown",
+		"text":       truncateTG(html),
+		"parse_mode": "HTML",
 	}
 	method := "sendMessage"
 	if r.EditID != "" {
@@ -623,10 +658,20 @@ func (t *Telegram) sendWithKeyboard(ctx context.Context, r Reply, keyboard [][]t
 	}
 	var result tgMessage
 	err := t.call(ctx, method, payload, &result)
-	if err != nil && strings.Contains(err.Error(), "can't parse entities") {
-		// The model produced Markdown Telegram rejects; resend as plain text.
-		delete(payload, "parse_mode")
-		err = t.call(ctx, method, payload, &result)
+	if err != nil && (strings.Contains(err.Error(), "can't parse entities") || strings.Contains(err.Error(), "Bad Request")) {
+		// Model output the HTML renderer could not balance; resend as plain
+		// text so a formatting bug never eats the reply.
+		plain := map[string]any{"chat_id": r.ChannelID, "text": truncateTG(r.Text)}
+		if r.EditID != "" {
+			plain["message_id"] = r.EditID
+			method = "editMessageText"
+		} else {
+			method = "sendMessage"
+			if r.ReplyTo != "" {
+				plain["reply_parameters"] = map[string]any{"message_id": r.ReplyTo, "allow_sending_without_reply": true}
+			}
+		}
+		err = t.call(ctx, method, plain, &result)
 	}
 	if err != nil {
 		return "", err

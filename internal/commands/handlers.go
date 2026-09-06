@@ -86,9 +86,7 @@ func cmdStatus(ctx context.Context, d Deps, _ Input) (Result, error) {
 func cmdModel(_ context.Context, d Deps, in Input) (Result, error) {
 	cfg := d.config()
 	if in.Args == "" {
-		return Result{Output: fmt.Sprintf(
-			"Model `%s` on provider `%s`.\n\nChange it with `/model <id>`.",
-			orDash(cfg.Model.Default), orDash(cfg.Model.Provider))}, nil
+		return Result{Output: modelPickerText(cfg), Action: Action{Kind: "model-picker"}}, nil
 	}
 	next, err := config.Reload()
 	if err != nil {
@@ -161,8 +159,8 @@ func cmdProvider(_ context.Context, d Deps, in Input) (Result, error) {
 			}
 			fmt.Fprintf(&b, "- `%s` — %s%s\n", n, state, marker)
 		}
-		b.WriteString("\nSwitch with `/provider <id>`.")
-		return Result{Output: b.String()}, nil
+		b.WriteString("\nTap a button to switch, or `/provider <id>`.")
+		return Result{Output: b.String(), Action: Action{Kind: "keyboard", Value: "provider"}}, nil
 	}
 
 	next, err := config.Reload()

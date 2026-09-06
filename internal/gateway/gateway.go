@@ -40,6 +40,15 @@ type InboundMessage struct {
 	MessageID string
 }
 
+// InlineButton is one tappable button on an inline keyboard. CallbackData is
+// the opaque payload delivered back as a callback query; adapters that cannot
+// render keyboards ignore the whole field. Keyboard lives in the commands
+// package (not here) so commands can build pickers without an import cycle.
+type InlineButton struct {
+	Text         string
+	CallbackData string
+}
+
 // Reply is what an adapter sends back.
 type Reply struct {
 	ChannelID string

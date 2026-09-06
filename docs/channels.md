@@ -25,10 +25,22 @@ gateway:
     allowed_users: []
     allowed_chats: []
     stream_edits: true
+    rich_messages: false
+    rich_drafts: false
 ```
 
 `stream_edits` edits the reply as it is generated, so you watch it appear rather
 than waiting for a wall of text.
+
+`rich_messages` opts final replies into Bot API 10.1 `sendRichMessage` with
+the raw agent markdown, so pipe tables, task lists, collapsible details, and
+block math render natively. Off by default: rich messages stay hard to copy
+as plain text on current clients, which is worse than the degraded rendering
+for command snippets and mobile handoffs. Streaming previews always stay on
+the legacy HTML path; finals upgrade in place via `editMessageText` with the
+`rich_message` param, so there is no duplicate preview. `rich_drafts` would
+opt previews into `sendRichMessageDraft` and stays off: desktop clients can
+leave rich draft frames overlaid until the chat redraws.
 
 ## Discord
 

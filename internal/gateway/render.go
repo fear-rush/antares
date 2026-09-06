@@ -2,7 +2,8 @@ package gateway
 
 import (
 	"strings"
-	"unicode/utf8"
+
+	"github.com/mattn/go-runewidth"
 )
 
 // This file renders model Markdown into Telegram HTML so tables and rich text
@@ -69,6 +70,145 @@ func renderTelegram(s string) string {
 	return strings.TrimRight(out.String(), "\n")
 }
 
+// needsRichRendering reports whether the text has constructs the legacy
+// HTML path degrades: pipe tables, GFM task lists, collapsible details,
+// block math. Ordinary replies stay on the legacy path so clients render a
+// consistent weight and spacing; rich is reserved for content where it
+// materially improves output.
+func needsRichRendering(s string) bool {
+	if strings.TrimSpace(s) == "" {
+		return false
+	}
+	if useRichMessage(s) {
+		return true
+	}
+	lines := strings.Split(s, "\n")
+	for _, ln := range lines {
+		t := strings.TrimSpace(ln)
+		for _, m := range []string{"- [ ] ", "- [x] ", "- [X] ", "* [ ] ", "* [x] ", "* [X] "} {
+			if strings.HasPrefix(t, m) {
+				return true
+			}
+		}
+		if strings.HasPrefix(t, "<details") || t == "</details>" ||
+			strings.HasPrefix(t, "<summary") || t == "</summary>" {
+			return true
+		}
+	}
+	return strings.Contains(s, "$$")
+}
+
+// richSkipDelivery reports content known to render badly or crash current
+// desktop clients: math inside collapsible details, and CJK text that leaves
+// overlay glyph artifacts in rich drafts. Both fall back to legacy HTML.
+func richSkipDelivery(s string) bool {
+	if strings.TrimSpace(s) == "" {
+		return false
+	}
+	lower := strings.ToLower(s)
+	if di := strings.Index(lower, "<details"); di >= 0 {
+		if end := strings.Index(lower[di:], "</details>"); end >= 0 {
+			block := s[di : di+end+len("</details>")]
+			if strings.Contains(block, "$$") || hasBlockMath(block) {
+				return true
+			}
+		}
+	}
+	return hasCJK(s)
+}
+
+func hasBlockMath(s string) bool {
+	for _, re := range []string{`\\[`, `\\(`, `\\sum`, `\\frac`, `\\sqrt`, `\\int`, `\\begin`} {
+		for i := 0; i+len(re) <= len(s); i++ {
+			if s[i:i+len(re)] == re {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hasCJK reports Hiragana/Katakana, CJK Unified, Hangul, or compatibility
+// ideographs. Byte-level scan avoids pulling a regex engine into the hot
+// send path.
+func hasCJK(s string) bool {
+	for _, r := range s {
+		switch {
+		case r >= 0x3040 && r <= 0x30FF,
+			r >= 0x3400 && r <= 0x4DBF,
+			r >= 0x4E00 && r <= 0x9FFF,
+			r >= 0xAC00 && r <= 0xD7AF,
+			r >= 0xF900 && r <= 0xFAFF,
+			r >= 0x20000 && r <= 0x323AF:
+			return true
+		}
+	}
+	return false
+}
+
+// richMarkdownPayload builds the InputRichMessage from raw agent markdown.
+// Never pass rendered HTML here: that would escape and destroy rich syntax
+// like table pipes. Single newlines become hard breaks so multi-line content
+// does not collapse; fenced code and pipe-table blocks stay verbatim.
+func richMarkdownPayload(s string) map[string]any {
+	return map[string]any{"markdown": richNormalizeLinebreaks(s)}
+}
+
+func richNormalizeLinebreaks(s string) string {
+	if s == "" || !strings.Contains(s, "\n") {
+		return s
+	}
+	lines := strings.Split(s, "\n")
+	type span struct{ start, end int }
+	var protected []span
+	i := 0
+	for i < len(lines) {
+		trimmed := strings.TrimSpace(lines[i])
+		if strings.HasPrefix(trimmed, "```") {
+			j := i + 1
+			for j < len(lines) && !strings.HasPrefix(strings.TrimSpace(lines[j]), "```") {
+				j++
+			}
+			if j < len(lines) {
+				j++
+			}
+			protected = append(protected, span{i, j})
+			i = j
+			continue
+		}
+		if isTableRow(trimmed) && i+1 < len(lines) && isTableDelimiter(lines[i+1]) {
+			j := i + 2
+			for j < len(lines) && isTableRow(strings.TrimSpace(lines[j])) {
+				j++
+			}
+			protected = append(protected, span{i, j})
+			i = j
+			continue
+		}
+		i++
+	}
+	inProtected := func(idx int) bool {
+		for _, p := range protected {
+			if idx >= p.start && idx < p.end {
+				return true
+			}
+		}
+		return false
+	}
+	var out strings.Builder
+	for idx, ln := range lines {
+		if idx > 0 {
+			prev, cur := lines[idx-1], ln
+			if prev != "" && cur != "" && !inProtected(idx-1) && !inProtected(idx) {
+				out.WriteString("  ")
+			}
+			out.WriteString("\n")
+		}
+		out.WriteString(ln)
+	}
+	return out.String()
+}
+
 // useRichMessage reports whether the text has a pipe table worth sending as a
 // native rich table instead of monospace.
 func useRichMessage(s string) bool {
@@ -81,51 +221,6 @@ func useRichMessage(s string) bool {
 	return false
 }
 
-// richTablePayload builds a sendRichMessage rich_message with markdown for the
-// prose and table blocks for pipe tables. Blocks, markdown, and html are
-// mutually exclusive per message; here blocks carry everything: prose becomes
-// paragraph blocks, tables become table blocks.
-func richTablePayload(s string) map[string]any {
-	s = strings.ReplaceAll(s, "\r\n", "\n")
-	lines := strings.Split(s, "\n")
-	var blocks []any
-	var prose []string
-	flush := func() {
-		if md := strings.TrimSpace(strings.Join(prose, "\n")); md != "" {
-			blocks = append(blocks, map[string]any{
-				"type":     "paragraph",
-				"markdown": md,
-			})
-		}
-		prose = nil
-	}
-	i := 0
-	for i < len(lines) {
-		trimmed := strings.TrimSpace(lines[i])
-		if isTableRow(trimmed) && i+1 < len(lines) && isTableDelimiter(lines[i+1]) {
-			end := i + 2
-			for end < len(lines) && isTableRow(strings.TrimSpace(lines[end])) {
-				end++
-			}
-			if b, ok := tableBlock(lines[i:end]); ok {
-				flush()
-				blocks = append(blocks, b)
-				i = end
-				continue
-			}
-		}
-		prose = append(prose, lines[i])
-		i++
-	}
-	flush()
-	if len(blocks) == 0 {
-		blocks = append(blocks, map[string]any{"type": "paragraph", "markdown": s})
-	}
-	return map[string]any{"blocks": blocks}
-}
-
-// splitMarkdownSafe splits on paragraph boundaries without cutting a fenced
-// code block or a pipe table in half.
 func splitMarkdownSafe(s string, limit int) []string {
 	if len(s) <= limit {
 		return []string{s}
@@ -257,56 +352,6 @@ func splitPipeRow(line string) []string {
 	return strings.Split(line, "|")
 }
 
-// tableBlock converts pipe-table lines to an InputRichBlockTable-style block.
-func tableBlock(lines []string) (map[string]any, bool) {
-	if len(lines) < 2 {
-		return nil, false
-	}
-	header := splitPipeRow(lines[0])
-	rows := [][]string{header}
-	hasBody := false
-	for _, ln := range lines[2:] {
-		row := splitPipeRow(ln)
-		rows = append(rows, row)
-		for _, c := range row {
-			if strings.TrimSpace(c) != "" {
-				hasBody = true
-			}
-		}
-	}
-	if !hasBody {
-		return nil, false
-	}
-	width := len(header)
-	toRich := func(cells []string) []any {
-		out := make([]any, 0, width)
-		for i := 0; i < width; i++ {
-			text := ""
-			if i < len(cells) {
-				text = strings.TrimSpace(cells[i])
-			}
-			out = append(out, map[string]any{
-				"type": "table_cell",
-				"text": map[string]any{"type": "text", "text": text},
-			})
-		}
-		return out
-	}
-	var body []any
-	for _, r := range rows[1:] {
-		body = append(body, map[string]any{"type": "table_row", "cells": toRich(r)})
-	}
-	return map[string]any{
-		"type": "table",
-		"header": map[string]any{
-			"type": "table_row", "cells": toRich(header), "is_header": true,
-		},
-		"body":     body,
-		"bordered": true,
-		"striped":  true,
-	}, true
-}
-
 // renderTableBlock lays a pipe table out as padded monospace.
 func renderTableBlock(lines []string) string {
 	rows := make([][]string, 0, len(lines))
@@ -370,16 +415,22 @@ func renderTableBlock(lines []string) string {
 	return b.String()
 }
 
+// displayWidth is the terminal cell width: CJK and most emoji count two.
+// A negative or zero result (control chars, unknown sequences) clamps to 0
+// so one bad glyph cannot corrupt the column math.
 func displayWidth(s string) int {
-	return utf8.RuneCountInString(s)
+	w := runewidth.StringWidth(s)
+	if w < 0 {
+		return 0
+	}
+	return w
 }
 
 func truncateCell(s string, max int) string {
-	r := []rune(s)
-	if len(r) > max {
-		return string(r[:max-1]) + "…"
+	if runewidth.StringWidth(s) <= max {
+		return s
 	}
-	return s
+	return runewidth.Truncate(s, max-1, "…")
 }
 
 func padCell(s string, w int) string {

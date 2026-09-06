@@ -30,6 +30,9 @@ type Telegram struct {
 	connected bool
 	offset    int64
 	me        string
+	// richOff latches after an endpoint-missing failure so later sends skip
+	// the doomed rich attempt entirely.
+	richOff bool
 }
 
 // NewTelegram builds the Telegram adapter.
@@ -146,6 +149,9 @@ type tgUpdate struct {
 
 // Start long-polls for updates until ctx is cancelled.
 func (t *Telegram) Start(ctx context.Context) error {
+	// Hydrate the rich-sent index so replies to rich messages sent before a
+	// restart still resolve their quoted text.
+	richSentLoad()
 	var me tgUser
 	if err := t.call(ctx, "getMe", nil, &me); err != nil {
 		return fmt.Errorf("getMe: %w", err)
@@ -280,7 +286,10 @@ func (t *Telegram) handleMessage(ctx context.Context, m tgMessage) {
 	}()
 
 	// A placeholder gives the user immediate feedback; it is edited as the
-	// answer streams in, then finalised.
+	// answer streams in, then finalised. Streaming previews stay on the
+	// legacy HTML edit path; only finals go rich. A rich draft would need
+	// sendRichMessageDraft plus a separate opt-in (rich_drafts): desktop
+	// clients can leave rich draft frames overlaid until the chat redraws.
 	placeholderID, err := t.Send(ctx, Reply{ChannelID: chatID, Text: "…", ReplyTo: msg.MessageID})
 	if err != nil {
 		slog.Warn("telegram: cannot send placeholder", "error", err)
@@ -330,11 +339,13 @@ func (t *Telegram) handleMessage(ctx context.Context, m tgMessage) {
 
 	for i, chunk := range splitMarkdownSafe(reply, telegramLimit) {
 		if i == 0 && placeholderID != "" {
-			// First chunk reuses the placeholder via edit; later chunks are
-			// new messages. editMessageText cannot switch to sendRichMessage,
-			// so the first chunk stays HTML; tables go native from chunk 2.
-			if _, err := t.sendRendered(ctx, Reply{ChannelID: chatID, Text: chunk, EditID: placeholderID}, nil); err != nil {
-				slog.Warn("telegram: send failed", "error", err)
+			// First chunk finalizes the streamed preview in place: rich edit
+			// when eligible (no duplicate preview), else the legacy HTML
+			// edit on the same message.
+			if _, ok := t.tryEditRich(ctx, chatID, placeholderID, chunk); !ok {
+				if _, err := t.sendRendered(ctx, Reply{ChannelID: chatID, Text: chunk, EditID: placeholderID}, nil); err != nil {
+					slog.Warn("telegram: send failed", "error", err)
+				}
 			}
 			continue
 		}
@@ -601,24 +612,134 @@ func (t *Telegram) sendWithKeyboard(ctx context.Context, r Reply, keyboard [][]t
 	return t.sendRendered(ctx, r, keyboard)
 }
 
-// sendRich posts one chunk via sendRichMessage with native table blocks when
-// the text has a pipe table, else falls back to sendMessage HTML.
+// richMaxChars is the one hard rich limit counted locally (32,768 UTF-8
+// chars). Other Bot API rich limits (500 blocks, 16 nesting, 20 columns)
+// are not pre-counted; Telegram rejects with BadRequest and the send
+// degrades to the legacy path.
+const richMaxChars = 32768
+
+// shouldAttemptRich mirrors Hermes _should_attempt_rich: rich only for final
+// sends (never streaming previews), only when opted in, only for constructs
+// the legacy HTML path degrades, never for known-bad client shapes, and only
+// inside the char cap.
+func (t *Telegram) shouldAttemptRich(text string, isFinal bool) bool {
+	if !isFinal || !t.cfg.RichMessages || t.richSendDisabled() {
+		return false
+	}
+	if strings.TrimSpace(text) == "" || !needsRichRendering(text) {
+		return false
+	}
+	if richSkipDelivery(text) {
+		return false
+	}
+	return len(text) <= richMaxChars
+}
+
+func (t *Telegram) richSendDisabled() bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.richOff
+}
+
+func (t *Telegram) latchRichOff() {
+	t.mu.Lock()
+	t.richOff = true
+	t.mu.Unlock()
+}
+
+// isRichCapabilityError reports endpoint-missing failures (old server): latch
+// rich off, never retry per message. Per-message BadRequests stay transient
+// eligible for legacy fallback.
+func isRichCapabilityError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	if strings.Contains(s, "no such method") || strings.Contains(s, "not implemented") {
+		return true
+	}
+	if (strings.Contains(s, "method") || strings.Contains(s, "endpoint")) &&
+		(strings.Contains(s, "not found") || strings.Contains(s, "does not exist")) {
+		return true
+	}
+	return strings.Contains(s, "(404)")
+}
+
+func isRichFallbackError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "bad request") || isRichCapabilityError(err) ||
+		strings.Contains(s, "unsupported")
+}
+
+// sendRich posts one chunk via sendRichMessage with the raw agent markdown
+// so tables, task lists, details, and math render natively. Never pass
+// rendered HTML here: that would escape and destroy rich syntax. Falls back
+// to sendMessage HTML on permanent rejections; transient failures surface
+// without a legacy resend so one send never delivers twice.
 func (t *Telegram) sendRich(ctx context.Context, chatID, text, replyTo string) (string, error) {
-	if !useRichMessage(text) {
+	if !t.shouldAttemptRich(text, true) {
 		return t.sendRendered(ctx, Reply{ChannelID: chatID, Text: text, ReplyTo: replyTo}, nil)
 	}
-	payload := map[string]any{"chat_id": chatID, "rich_message": richTablePayload(text)}
+	payload := map[string]any{"chat_id": chatID, "rich_message": richMarkdownPayload(text)}
 	if replyTo != "" {
 		payload["reply_parameters"] = map[string]any{"message_id": replyTo, "allow_sending_without_reply": true}
 	}
 	var result tgMessage
 	if err := t.call(ctx, "sendRichMessage", payload, &result); err != nil {
-		if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "Bad Request") {
+		if isRichFallbackError(err) {
+			if isRichCapabilityError(err) {
+				t.latchRichOff()
+			}
+			slog.Debug("telegram: sendRichMessage rejected, falling back to HTML", "error", err)
 			return t.sendRendered(ctx, Reply{ChannelID: chatID, Text: text, ReplyTo: replyTo}, nil)
 		}
+		// Transient or unknown: the request may have reached Telegram, so do
+		// NOT legacy-resend and risk a duplicate.
 		return "", err
 	}
-	return strconv.FormatInt(result.MessageID, 10), nil
+	mid := strconv.FormatInt(result.MessageID, 10)
+	richSentRecord(chatID, mid, text)
+	return mid, nil
+}
+
+// tryEditRich finalizes a streamed preview in place via editMessageText with
+// the rich_message param: no fresh send plus delete, no duplicate preview.
+// Returns false when the caller should fall back to the legacy HTML edit.
+func (t *Telegram) tryEditRich(ctx context.Context, chatID, editID, text string) (string, bool) {
+	if !t.shouldAttemptRich(text, true) {
+		return "", false
+	}
+	payload := map[string]any{
+		"chat_id": chatID, "message_id": editID,
+		"rich_message": richMarkdownPayload(text),
+	}
+	var result tgMessage
+	if err := t.call(ctx, "editMessageText", payload, &result); err != nil {
+		if isRichFallbackError(err) {
+			if isRichCapabilityError(err) {
+				t.latchRichOff()
+			}
+			if strings.Contains(strings.ToLower(err.Error()), "not modified") {
+				return editID, true
+			}
+			slog.Debug("telegram: rich editMessageText rejected, falling back to HTML edit", "error", err)
+			return "", false
+		}
+		if strings.Contains(strings.ToLower(err.Error()), "not modified") {
+			return editID, true
+		}
+		slog.Warn("telegram: rich edit transient failure, no legacy resend", "error", err)
+		return "", true
+	}
+	mid := strconv.FormatInt(result.MessageID, 10)
+	if mid == "0" {
+		mid = editID
+	}
+	richSentRecord(chatID, mid, text)
+	return mid, true
 }
 
 func (t *Telegram) sendRendered(ctx context.Context, r Reply, keyboard [][]tgInlineButton) (string, error) {

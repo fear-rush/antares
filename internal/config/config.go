@@ -768,6 +768,17 @@ type Telegram struct {
 	AllowedChats   []string `yaml:"allowed_chats" json:"allowed_chats"`
 	RequirePairing bool     `yaml:"require_pairing" json:"require_pairing"`
 	StreamEdits    bool     `yaml:"stream_edits" json:"stream_edits"`
+	// RichMessages opts into Bot API 10.1 sendRichMessage for replies that
+	// contain constructs the legacy path degrades (pipe tables, task lists,
+	// collapsible details, block math). Default off: rich messages stay hard
+	// to copy as plain text on current clients, which is worse than the
+	// degraded rendering for command snippets and mobile handoffs. Mirrors
+	// Hermes platforms.telegram.extra.rich_messages.
+	RichMessages bool `yaml:"rich_messages" json:"rich_messages"`
+	// RichDrafts opts streaming previews into sendRichMessageDraft. Separate
+	// opt-in: macOS/Desktop clients can leave rich draft frames overlaid
+	// until the chat redraws. Requires RichMessages.
+	RichDrafts bool `yaml:"rich_drafts" json:"rich_drafts"`
 }
 
 // Discord bot settings.

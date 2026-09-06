@@ -52,15 +52,14 @@ func TestUseRichMessage(t *testing.T) {
 	}
 }
 
-func TestRichTablePayload(t *testing.T) {
-	p := richTablePayload("intro\n\n| A | B |\n|---|---|\n| 1 | 2 |")
-	blocks, ok := p["blocks"].([]any)
-	if !ok || len(blocks) != 2 {
+func TestRichMarkdownPayload(t *testing.T) {
+	p := richMarkdownPayload("intro\nline two\n\n| A | B |\n|---|---|\n| 1 | 2 |")
+	md, ok := p["markdown"].(string)
+	if !ok {
 		t.Fatalf("got %#v", p)
 	}
-	table, ok := blocks[1].(map[string]any)
-	if !ok || table["type"] != "table" {
-		t.Fatalf("got %#v", blocks[1])
+	if !strings.Contains(md, "intro  \nline two") || !strings.Contains(md, "| A | B |") {
+		t.Fatalf("got %q", md)
 	}
 }
 

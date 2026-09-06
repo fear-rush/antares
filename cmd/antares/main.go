@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -343,12 +344,191 @@ func gatewayProgress(answer, status string) string {
 	lines := strings.Split(base, "\n")
 	kept := lines[:0]
 	for _, ln := range lines {
-		if strings.HasPrefix(ln, "🔧 ") || strings.HasPrefix(ln, "📌 ") {
+		if isStatusLine(ln) {
 			continue
 		}
 		kept = append(kept, ln)
 	}
 	return strings.TrimSpace(strings.Join(kept, "\n")) + "\n\n" + status
+}
+
+func isStatusLine(ln string) bool {
+	for _, p := range []string{"🔧 ", "📌 ", "💻 ", "📄 ", "✏️ ", "🔍 ", "🌐 ", "🤖 ", "🧰 ", "📋 ", "🧠 ", "📚 ", "🖥️ ", "⏰ ", "❓ "} {
+		if strings.HasPrefix(ln, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// toolLine renders one tool call as a readable status line: an icon, the
+// tool name, and a short human summary of its arguments. This is what the
+// gateway shows while a tool runs, so the user sees what is happening
+// without reading raw JSON.
+func toolLine(name, args string) string {
+	icon := toolIcon(name)
+	summary := summarizeArgs(name, args)
+	if summary == "" {
+		return icon + " " + name
+	}
+	return icon + " " + name + " — " + summary
+}
+
+func toolIcon(name string) string {
+	switch name {
+	case "terminal", "process":
+		return "💻"
+	case "read_file", "read_document", "list_files", "glob":
+		return "📄"
+	case "write_file", "edit_file":
+		return "✏️"
+	case "grep":
+		return "🔍"
+	case "web_search":
+		return "🔍"
+	case "web_fetch", "http_request", "browser", "hackbrowser":
+		return "🌐"
+	case "delegate_task", "task":
+		return "🤖"
+	case "skill":
+		return "🧰"
+	case "todo":
+		return "📋"
+	case "memory":
+		return "🧠"
+	case "rag_search", "rag_index", "session_search":
+		return "📚"
+	case "vps_run", "vps_upload", "vps_download":
+		return "🖥️"
+	case "schedule", "cronjob":
+		return "⏰"
+	case "ask_user":
+		return "❓"
+	case "board", "project_info":
+		return "📌"
+	default:
+		return "🔧"
+	}
+}
+
+// summarizeArgs picks the one argument worth showing for a tool: the command,
+// path, URL, query, or task. Falls back to the first short scalar.
+func summarizeArgs(name, raw string) string {
+	args := parseArgsObject(raw)
+	if len(args) == 0 {
+		return ""
+	}
+	keys := toolArgKeys(name)
+	for _, k := range keys {
+		if v, ok := args[k]; ok && v != "" {
+			return truncateStatus(v)
+		}
+	}
+	for _, k := range []string{"command", "cmd", "path", "file", "url", "query", "prompt", "goal", "task", "text", "question", "name", "id"} {
+		if v, ok := args[k]; ok && v != "" {
+			return truncateStatus(v)
+		}
+	}
+	for _, v := range args {
+		if v != "" {
+			return truncateStatus(v)
+		}
+	}
+	return ""
+}
+
+func toolArgKeys(name string) []string {
+	switch name {
+	case "terminal", "process":
+		return []string{"command", "cmd"}
+	case "read_file", "read_document", "write_file", "edit_file", "list_files":
+		return []string{"path", "file"}
+	case "grep", "glob":
+		return []string{"pattern", "path"}
+	case "web_search":
+		return []string{"query"}
+	case "web_fetch", "http_request", "browser":
+		return []string{"url"}
+	case "delegate_task":
+		return []string{"goal", "prompt", "task", "role"}
+	case "task":
+		return []string{"action", "id"}
+	case "skill":
+		return []string{"action", "name"}
+	case "todo":
+		return []string{"action"}
+	case "memory":
+		return []string{"action", "query", "text"}
+	case "schedule":
+		return []string{"action", "name"}
+	}
+	return nil
+}
+
+func parseArgsObject(raw string) map[string]string {
+	out := map[string]string{}
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "{}" {
+		return out
+	}
+	var v map[string]any
+	if err := json.Unmarshal([]byte(raw), &v); err != nil {
+		return out
+	}
+	for k, val := range v {
+		switch t := val.(type) {
+		case string:
+			if strings.TrimSpace(t) != "" {
+				out[k] = strings.TrimSpace(t)
+			}
+		case float64:
+			out[k] = strings.TrimRight(strings.TrimRight(fmt.Sprintf("%v", t), "0"), ".")
+		case bool:
+			out[k] = fmt.Sprintf("%v", t)
+		}
+	}
+	return out
+}
+
+// lastStatus remembers the newest status line per gateway turn so text
+// deltas can re-attach it. Keyed by nothing: one turn at a time per chat.
+var lastStatus = struct {
+	sync.Mutex
+	s string
+}{}
+
+func setLastStatus(s string) {
+	lastStatus.Lock()
+	lastStatus.s = s
+	lastStatus.Unlock()
+}
+
+func getLastStatus() string {
+	lastStatus.Lock()
+	defer lastStatus.Unlock()
+	return lastStatus.s
+}
+
+// gatewayProgressLive re-attaches the last status line when fresh answer text
+// arrives. Without this, the first text delta after a tool call would wipe
+// the status and the user would see text-only until the next tool runs.
+func gatewayProgressLive(answer string) string {
+	if st := getLastStatus(); st != "" {
+		return gatewayProgress(answer, st)
+	}
+	return answer
+}
+
+func itoa(n int) string {
+	return fmt.Sprintf("%d", n)
+}
+
+func truncateStatus(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) > 120 {
+		return s[:117] + "…"
+	}
+	return s
 }
 
 // lastLine keeps only the final line of a progress message so multi-line tool
@@ -433,23 +613,33 @@ func (rt *runtimeServices) handleGatewayMessage(ctx context.Context, msg gateway
 		case agent.EventText:
 			reply.WriteString(e.Delta)
 			if partial != nil {
-				partial(reply.String())
+				partial(gatewayProgressLive(reply.String()))
+			}
+		case agent.EventTurn:
+			if partial != nil && e.Turn > 1 {
+				partial(gatewayProgress(reply.String(), "⏭️ turn "+itoa(e.Turn)))
 			}
 		case agent.EventToolCall:
 			// Surface tool activity on the gateway: a long task that only
 			// streams text looks dead while it reads files, runs shell
-			// commands, or fans out to sub-agents (delegate_task forwards
-			// "sub-agent: <tool>" progress via OnProgress).
+			// commands, or fans out to sub-agents. Render the call as a
+			// readable line (icon plus key argument), not raw JSON.
 			if partial != nil {
-				partial(gatewayProgress(reply.String(), "🔧 "+e.Name))
+				line := toolLine(e.Name, e.Arguments)
+				setLastStatus(line)
+				partial(gatewayProgress(reply.String(), line))
 			}
 		case agent.EventToolProgress:
 			if partial != nil && strings.TrimSpace(e.Message) != "" {
-				partial(gatewayProgress(reply.String(), "🔧 "+e.Name+": "+lastLine(e.Message)))
+				line := toolIcon(e.Name) + " " + e.Name + ": " + truncateStatus(lastLine(e.Message))
+				setLastStatus(line)
+				partial(gatewayProgress(reply.String(), line))
 			}
 		case agent.EventNotice:
 			if partial != nil && strings.TrimSpace(e.Message) != "" {
-				partial(gatewayProgress(reply.String(), "📌 "+lastLine(e.Message)))
+				line := "📌 " + lastLine(e.Message)
+				setLastStatus(line)
+				partial(gatewayProgress(reply.String(), line))
 			}
 		}
 		return nil

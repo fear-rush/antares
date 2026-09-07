@@ -804,26 +804,35 @@ func (t *Telegram) sendRendered(ctx context.Context, r Reply, keyboard [][]tgInl
 const telegramLimit = 4000
 
 func truncateTG(s string) string {
-	if len(s) <= telegramLimit {
+	// Rune cut: a byte cut inside a multi-byte character renders as
+	// mojibake on the client.
+	if len([]rune(s)) <= telegramLimit {
 		return s
 	}
-	return s[:telegramLimit] + "…"
+	return string([]rune(s)[:telegramLimit]) + "…"
 }
 
 // splitForTelegram breaks a long reply on paragraph boundaries where possible.
+// Cuts are rune-aligned: a byte cut inside a multi-byte character renders
+// as mojibake on the client.
 func splitForTelegram(s string) []string {
-	if len(s) <= telegramLimit {
+	if len([]rune(s)) <= telegramLimit {
 		return []string{s}
 	}
 	var out []string
-	for len(s) > telegramLimit {
-		cut := strings.LastIndex(s[:telegramLimit], "\n\n")
+	for len([]rune(s)) > telegramLimit {
+		head := string([]rune(s)[:telegramLimit])
+		cut := strings.LastIndex(head, "\n\n")
 		if cut < telegramLimit/2 {
-			cut = strings.LastIndex(s[:telegramLimit], "\n")
+			cut = strings.LastIndex(head, "\n")
 		}
 		if cut < telegramLimit/2 {
-			cut = telegramLimit
+			out = append(out, strings.TrimSpace(head))
+			s = strings.TrimSpace(string([]rune(s)[telegramLimit:]))
+			continue
 		}
+		// cut is a byte index into head, which is a rune-aligned prefix of
+		// s, so it is a valid cut point in s as well.
 		out = append(out, strings.TrimSpace(s[:cut]))
 		s = strings.TrimSpace(s[cut:])
 	}

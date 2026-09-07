@@ -78,3 +78,26 @@ func TestDisplayWidthCJK(t *testing.T) {
 		t.Fatalf("got %d", displayWidth(""))
 	}
 }
+
+func TestInlineHTMLKeepsMultibyte(t *testing.T) {
+	in := "task_1 done — researcher · Riset na…"
+	out := inlineHTML(in)
+	if !strings.Contains(out, "done — researcher · Riset na…") {
+		t.Fatalf("multibyte mangled: %q", out)
+	}
+}
+
+func TestSplitMarkdownSafeRuneAligned(t *testing.T) {
+	in := "done — researcher · na… kip"
+	chunks := splitMarkdownSafe(in, 10)
+	for _, c := range chunks {
+		for _, r := range c {
+			if r == '�' {
+				t.Fatalf("replacement char in chunk %q", c)
+			}
+		}
+		if len([]rune(c)) > 20 {
+			t.Fatalf("chunk too long: %q", c)
+		}
+	}
+}

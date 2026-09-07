@@ -222,7 +222,9 @@ func useRichMessage(s string) bool {
 }
 
 func splitMarkdownSafe(s string, limit int) []string {
-	if len(s) <= limit {
+	// Limits are rune counts: byte cuts inside multi-byte characters
+	// render as mojibake on the client.
+	if len([]rune(s)) <= limit {
 		return []string{s}
 	}
 	lines := strings.Split(s, "\n")
@@ -279,28 +281,37 @@ func splitMarkdownSafe(s string, limit int) []string {
 		cur = nil
 		curLen = 0
 	}
+	rlen := func(x string) int { return len([]rune(x)) }
+	cutRunes := func(x string, n int) (string, string) {
+		r := []rune(x)
+		return string(r[:n]), strings.TrimSpace(string(r[n:]))
+	}
 	for _, b := range blocks {
 		text := strings.Join(lines[b.start:b.end], "\n")
-		if curLen+len(text)+1 > limit && curLen > 0 {
+		if curLen+rlen(text)+1 > limit && curLen > 0 {
 			push()
 		}
-		if len(text) > limit {
-			for len(text) > limit {
-				cut := strings.LastIndex(text[:limit], "\n")
+		if rlen(text) > limit {
+			for rlen(text) > limit {
+				r := []rune(text)
+				cut := strings.LastIndex(string(r[:limit]), "\n")
 				if cut < limit/2 {
-					cut = limit
+					out = append(out, strings.TrimSpace(string(r[:limit])))
+					text = strings.TrimSpace(string(r[limit:]))
+					continue
 				}
-				out = append(out, strings.TrimSpace(text[:cut]))
-				text = strings.TrimSpace(text[cut:])
+				head, tail := cutRunes(text, cut)
+				out = append(out, strings.TrimSpace(head))
+				text = tail
 			}
 			if text != "" {
 				cur = append(cur, text)
-				curLen += len(text) + 1
+				curLen += rlen(text) + 1
 			}
 			continue
 		}
 		cur = append(cur, text)
-		curLen += len(text) + 1
+		curLen += rlen(text) + 1
 	}
 	push()
 	if len(out) == 0 {
@@ -471,10 +482,13 @@ func renderLineHTML(line string) string {
 }
 
 // inlineHTML maps inline Markdown to the HTML subset Telegram accepts.
+// It walks runes, not bytes: slicing a multi-byte character mid-sequence
+// used to emit mojibake like "done \u00e2\u0080\u0094" for an em dash.
 func inlineHTML(s string) string {
+	runes := []rune(s)
 	var out strings.Builder
 	i := 0
-	n := len(s)
+	n := len(runes)
 	bold, italic, code, strike := false, false, false, false
 	flush := func(tag string, open *bool) {
 		if *open {
@@ -484,33 +498,39 @@ func inlineHTML(s string) string {
 		}
 		*open = !*open
 	}
+	at := func(off int) string {
+		if i+off >= n {
+			return ""
+		}
+		return string(runes[i+off:])
+	}
 	for i < n {
 		switch {
-		case s[i] == '\\' && i+1 < n && strings.ContainsRune(`_*[]()~`+"`"+`>#+-=|{}.!`, rune(s[i+1])):
-			out.WriteString(escapeHTML(string(s[i+1])))
+		case runes[i] == '\\' && i+1 < n && strings.ContainsRune(`_*[]()~`+"`"+`>#+-=|{}.!`, runes[i+1]):
+			out.WriteString(escapeHTML(string(runes[i+1])))
 			i += 2
-		case strings.HasPrefix(s[i:], "**") && !code:
+		case strings.HasPrefix(at(0), "**") && !code:
 			flush("b", &bold)
 			i += 2
-		case s[i] == '`' && !code && i+1 < n && s[i+1] == '`':
+		case runes[i] == '`' && !code && i+1 < n && runes[i+1] == '`':
 			i += 2
-		case s[i] == '`':
+		case runes[i] == '`':
 			flush("code", &code)
 			i++
-		case strings.HasPrefix(s[i:], "~~") && !code:
+		case strings.HasPrefix(at(0), "~~") && !code:
 			flush("s", &strike)
 			i += 2
-		case s[i] == '~' && !code:
+		case runes[i] == '~' && !code:
 			flush("s", &strike)
 			i++
-		case (s[i] == '*' || s[i] == '_') && !code:
+		case (runes[i] == '*' || runes[i] == '_') && !code:
 			flush("i", &italic)
 			i++
-		case s[i] == '[' && !code:
-			end := strings.Index(s[i:], "](")
+		case runes[i] == '[' && !code:
+			end := strings.Index(at(0), "](")
 			if end > 0 {
-				label := s[i+1 : i+end]
-				rest := s[i+end+2:]
+				label := string(runes[i+1 : i+end])
+				rest := string(runes[i+end+2:])
 				close := strings.Index(rest, ")")
 				if close >= 0 {
 					url := rest[:close]
@@ -519,10 +539,10 @@ func inlineHTML(s string) string {
 					continue
 				}
 			}
-			out.WriteString(escapeHTML(string(s[i])))
+			out.WriteString(escapeHTML(string(runes[i])))
 			i++
 		default:
-			out.WriteString(escapeHTML(string(s[i])))
+			out.WriteString(escapeHTML(string(runes[i])))
 			i++
 		}
 	}

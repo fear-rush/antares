@@ -561,8 +561,11 @@ func firstLine(s string) string {
 		s = s[:i]
 	}
 	s = strings.TrimSpace(s)
-	if len(s) > 120 {
-		return s[:117] + "…"
+	// Truncate by runes: a byte cut inside a multi-byte character renders
+	// as mojibake downstream.
+	r := []rune(s)
+	if len(r) > 120 {
+		return string(r[:117]) + "…"
 	}
 	return s
 }

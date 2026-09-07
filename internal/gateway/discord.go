@@ -8,7 +8,10 @@ import (
 	"io"
 	"log/slog"
 	"math/rand"
+	"mime/multipart"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -630,8 +633,13 @@ func (d *Discord) handleMessage(ctx context.Context, m dcMessage) {
 	}
 }
 
-// Send posts a message and returns its id.
+// Send posts a message and returns its id. A Reply with FilePath uploads
+// the file as a Discord attachment (10MB cap); text becomes the message
+// content alongside it.
 func (d *Discord) Send(ctx context.Context, r Reply) (string, error) {
+	if strings.TrimSpace(r.FilePath) != "" {
+		return d.sendFile(ctx, r)
+	}
 	payload := discordMessagePayload(r.Text, r.ReplyTo)
 
 	var result struct {
@@ -643,6 +651,78 @@ func (d *Discord) Send(ctx context.Context, r Reply) (string, error) {
 	}
 	err := d.rest(ctx, "POST", "/channels/"+r.ChannelID+"/messages", payload, &result)
 	return result.ID, err
+}
+
+// discordFileMaxBytes caps one file upload (Discord's limit for regular bots).
+const discordFileMaxBytes = 10 << 20
+
+// sendFile uploads a local file as a Discord message attachment.
+func (d *Discord) sendFile(ctx context.Context, r Reply) (string, error) {
+	path := strings.TrimSpace(r.FilePath)
+	st, err := os.Stat(path)
+	if err != nil {
+		return "", fmt.Errorf("file not found: %s", path)
+	}
+	if st.IsDir() {
+		return "", fmt.Errorf("not a file: %s", path)
+	}
+	if st.Size() > discordFileMaxBytes {
+		return "", fmt.Errorf("file too large (%d bytes, max %d): %s", st.Size(), discordFileMaxBytes, path)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	content := strings.TrimSpace(firstNonEmpty(r.Caption, r.Text))
+	body := &bytes.Buffer{}
+	w := multipart.NewWriter(body)
+	payload := map[string]any{}
+	if content != "" {
+		payload["content"] = content
+	}
+	if r.ReplyTo != "" {
+		payload["message_reference"] = map[string]any{"message_id": r.ReplyTo}
+	}
+	pj, _ := json.Marshal(payload)
+	_ = w.WriteField("payload_json", string(pj))
+	part, err := w.CreateFormFile("files[0]", filepath.Base(path))
+	if err != nil {
+		return "", err
+	}
+	if _, err := io.Copy(part, f); err != nil {
+		return "", err
+	}
+	if err := w.Close(); err != nil {
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", discordAPI+"/channels/"+r.ChannelID+"/messages", body)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bot "+d.cfg.BotToken)
+	req.Header.Set("User-Agent", "DiscordBot (https://github.com/enowdev/antares, "+version.Version+")")
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	resp, err := d.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode >= 400 {
+		return "", fmt.Errorf("discord POST files returned %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
+	}
+	var result struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(data, &result); err != nil {
+		return "", err
+	}
+	return result.ID, nil
 }
 
 // Embed kinds and their left-bar colours (semantic, decimal RGB for Discord).

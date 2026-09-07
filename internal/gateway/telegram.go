@@ -7,7 +7,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime/multipart"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -609,7 +612,127 @@ func (t *Telegram) SendKeyboard(ctx context.Context, r Reply, keyboard [][]tgInl
 }
 
 func (t *Telegram) sendWithKeyboard(ctx context.Context, r Reply, keyboard [][]tgInlineButton) (string, error) {
+	if strings.TrimSpace(r.FilePath) != "" {
+		return t.sendFile(ctx, r)
+	}
 	return t.sendRendered(ctx, r, keyboard)
+}
+
+// sendFileMaxBytes caps one gateway file send so a runaway artifact cannot
+// exhaust disk or blow the Bot API upload budget.
+const sendFileMaxBytes = 50 << 20
+
+// sendFile delivers a local file to the chat: photos and videos render
+// inline, everything else goes as a document. Text becomes the caption
+// (Telegram caps captions at 1024 chars) so nothing is silently dropped.
+func (t *Telegram) sendFile(ctx context.Context, r Reply) (string, error) {
+	path := strings.TrimSpace(r.FilePath)
+	st, err := os.Stat(path)
+	if err != nil {
+		return "", fmt.Errorf("file not found: %s", path)
+	}
+	if st.IsDir() {
+		return "", fmt.Errorf("not a file: %s", path)
+	}
+	if st.Size() > sendFileMaxBytes {
+		return "", fmt.Errorf("file too large (%d bytes, max %d): %s", st.Size(), sendFileMaxBytes, path)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	caption := firstNonEmpty(r.Caption, r.Text)
+	caption = string(truncateCaption([]rune(strings.TrimSpace(caption))))
+	method, field, _ := fileMethod(path)
+	body := &bytes.Buffer{}
+	w := multipart.NewWriter(body)
+	_ = w.WriteField("chat_id", r.ChannelID)
+	if r.ReplyTo != "" {
+		_ = w.WriteField("reply_parameters", `{"message_id":`+r.ReplyTo+`,"allow_sending_without_reply":true}`)
+	}
+	if caption != "" {
+		_ = w.WriteField("caption", caption)
+		_ = w.WriteField("parse_mode", "HTML")
+	}
+	part, err := w.CreateFormFile(field, filepath.Base(path))
+	if err != nil {
+		return "", err
+	}
+	if _, err := io.Copy(part, f); err != nil {
+		return "", err
+	}
+	if err := w.Close(); err != nil {
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", t.baseURL+"/"+method, body)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", version.UserAgent())
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	resp, err := t.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	var envelope struct {
+		OK          bool            `json:"ok"`
+		Result      json.RawMessage `json:"result"`
+		Description string          `json:"description"`
+		ErrorCode   int             `json:"error_code"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+		return "", fmt.Errorf("decode %s: %w", method, err)
+	}
+	if !envelope.OK {
+		return "", fmt.Errorf("telegram %s failed (%d): %s", method, envelope.ErrorCode, envelope.Description)
+	}
+	var result tgMessage
+	if err := json.Unmarshal(envelope.Result, &result); err != nil {
+		return "", err
+	}
+	return strconv.FormatInt(result.MessageID, 10), nil
+}
+
+// telegramCaptionMax is the Bot API caption cap.
+const telegramCaptionMax = 1024
+
+func truncateCaption(r []rune) []rune {
+	if len(r) <= telegramCaptionMax {
+		return r
+	}
+	return append(r[:telegramCaptionMax-1], '…')
+}
+
+// fileMethod picks the Bot API method and form field for a path: photos and
+// videos render inline, audio goes as audio, everything else as a document.
+func fileMethod(path string) (method, field, contentType string) {
+	switch strings.ToLower(strings.TrimSuffix(filepath.Ext(path), "")) {
+	case ".jpg", ".jpeg":
+		return "sendPhoto", "photo", "image/jpeg"
+	case ".png":
+		return "sendPhoto", "photo", "image/png"
+	case ".gif":
+		return "sendAnimation", "animation", "image/gif"
+	case ".webp":
+		return "sendPhoto", "photo", "image/webp"
+	case ".mp4":
+		return "sendVideo", "video", "video/mp4"
+	case ".mov":
+		return "sendVideo", "video", "video/quicktime"
+	case ".mp3":
+		return "sendAudio", "audio", "audio/mpeg"
+	case ".ogg", ".oga":
+		return "sendAudio", "audio", "audio/ogg"
+	case ".wav":
+		return "sendAudio", "audio", "audio/wav"
+	case ".weba":
+		return "sendAudio", "audio", "audio/webm"
+	default:
+		return "sendDocument", "document", "application/octet-stream"
+	}
 }
 
 // richMaxChars is the one hard rich limit counted locally (32,768 UTF-8

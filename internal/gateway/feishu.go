@@ -173,6 +173,10 @@ func (f *Feishu) dispatch(ctx context.Context, m fsMessage) {
 
 // Send posts a text message to a chat.
 func (f *Feishu) Send(ctx context.Context, r Reply) (string, error) {
+	if strings.TrimSpace(r.FilePath) != "" {
+		r.Text = fileFallbackText(r)
+	}
+
 	tok, err := f.tenantToken(ctx)
 	if err != nil {
 		return "", err

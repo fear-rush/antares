@@ -49,6 +49,7 @@ const (
 	EventNotice       EventType = "notice"
 	EventApproval     EventType = "approval"
 	EventAsk          EventType = "ask"   // ask_user is waiting for the person's answer; the turn is paused
+	EventFile         EventType = "file"  // send_file queued a file for the surface to deliver
 	EventReset        EventType = "reset" // discard the partial assistant turn (before a retry)
 	EventError        EventType = "error"
 	EventDone         EventType = "done"
@@ -69,13 +70,16 @@ type Event struct {
 	// text / reasoning
 	Delta string `json:"delta,omitempty"`
 
-	// tool_call / tool_progress / tool_result
+	// tool_call / tool_progress / tool_result / file
 	Name      string `json:"name,omitempty"`
 	Arguments string `json:"arguments,omitempty"`
 	Content   string `json:"content,omitempty"`
 	Chunk     string `json:"chunk,omitempty"`
 	Message   string `json:"message,omitempty"`
 	IsError   bool   `json:"is_error,omitempty"`
+	// file: absolute path to deliver plus its caption.
+	FilePath  string `json:"file_path,omitempty"`
+	Caption   string `json:"caption,omitempty"`
 
 	// turn
 	Turn int `json:"turn,omitempty"`
@@ -411,6 +415,10 @@ func (a *Agent) Run(ctx context.Context, req Request, emit Emit) (*Result, error
 		maxTurns = 50
 	}
 
+	// Snapshot the workspace before the turn so files the agent creates
+	// can be delivered automatically at the end (gateway auto-send).
+	beforeFiles := listDirFiles(sess.Workspace)
+
 	var (
 		total              llm.Usage
 		lastReply          string
@@ -663,6 +671,16 @@ func (a *Agent) Run(ctx context.Context, req Request, emit Emit) (*Result, error
 
 	if turn > maxTurns {
 		_ = emit(Event{Type: EventNotice, Message: fmt.Sprintf("turn limit reached (%d)", maxTurns)})
+	}
+
+	// Auto-send: every file created in the workspace this turn goes out as
+	// an EventFile alongside explicit send_file calls. Surfaces that cannot
+	// deliver files (dashboard) render a download link instead; surfaces
+	// that can (Telegram, Discord) push the real attachment.
+	if !req.Quiet && req.Depth == 0 {
+		for _, fp := range newWorkspaceFiles(sess.Workspace, beforeFiles) {
+			_ = emit(Event{Type: EventFile, Name: "send_file", FilePath: fp})
+		}
 	}
 
 	if !req.Quiet {
@@ -967,6 +985,15 @@ func (a *Agent) executeTools(
 			isError: res.IsError,
 		}
 		_ = safeEmit(Event{Type: EventToolResult, ID: call.ID, Name: call.Name, Content: content, IsError: res.IsError})
+		// send_file is a delivery instruction, not just a result: surface it
+		// as its own event so the caller (gateway, dashboard) can push the
+		// file to the person right away.
+		if call.Name == "send_file" && !res.IsError {
+			if fp, _ := res.Meta["send_file"].(string); fp != "" {
+				cap, _ := res.Meta["caption"].(string)
+				_ = safeEmit(Event{Type: EventFile, ID: call.ID, Name: call.Name, FilePath: fp, Caption: cap})
+			}
+		}
 	}
 
 	// recoverRun wraps run() with panic recovery so a panicking tool cannot

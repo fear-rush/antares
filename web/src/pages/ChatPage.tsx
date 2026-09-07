@@ -716,6 +716,22 @@ export default function ChatPage() {
           setAskId(String(event.id ?? ''))
           setLive((s) => ({ ...s, tool: undefined, waiting: true, notice: undefined }))
           break
+        case 'file':
+          // send_file queued a file: append a download link to the reply so
+          // the person can fetch it straight from the transcript.
+          {
+            const fp = String(event.file_path ?? '')
+            const cap = String(event.caption ?? '')
+            if (fp) {
+              // handleRawFile confines reads to the workspace: send a
+              // workspace-relative path so the link resolves.
+              const name = fp.split('/').pop() || fp
+              const link = `[${name}](/api/files/raw?path=${encodeURIComponent(name)}&download=1)`
+              const line = (cap ? cap + '\n' : '') + `File ready: ${link}`
+              enqueueDelta(assistantId, 'text', (line ?? '') + '\n')
+            }
+          }
+          break
         case 'usage':
           patchAssistant((m) => ({
             ...m,

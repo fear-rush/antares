@@ -588,6 +588,7 @@ func (rt *runtimeServices) handleGatewayMessage(ctx context.Context, msg gateway
 	}
 
 	var reply strings.Builder
+	var pendingFiles []agent.Event
 	req := agent.Request{
 		SessionID:       sessionID,
 		Message:         msg.Text,
@@ -649,16 +650,48 @@ func (rt *runtimeServices) handleGatewayMessage(ctx context.Context, msg gateway
 			// waited on.
 			slog.Warn("gateway turn parked on ask_user with no live card",
 				"platform", msg.Platform, "session", sessionID, "ask", e.ID)
+		case agent.EventFile:
+			// send_file queued a file: deliver it straight to the chat now,
+			// in turn order, instead of waiting for the final text reply.
+			if strings.TrimSpace(e.FilePath) != "" {
+				pendingFiles = append(pendingFiles, e)
+			}
 		}
 		return nil
 	})
 	if err != nil {
 		return "", err
 	}
+	// Flush queued files before the text reply: the person asked for the
+	// file, so it lands first, then the summary text follows as usual.
+	// Explicit send_file calls and auto-sent workspace arrivals share one
+	// queue; dedupe by path so a file sent both ways goes out once.
+	seenFile := map[string]bool{}
+	for _, fe := range pendingFiles {
+		if seenFile[fe.FilePath] {
+			continue
+		}
+		seenFile[fe.FilePath] = true
+		if derr := rt.deliverGatewayFile(ctx, msg, fe.FilePath, fe.Caption); derr != nil {
+			slog.Warn("gateway file delivery failed",
+				"platform", msg.Platform, "session", sessionID, "file", fe.FilePath, "error", derr)
+			reply.WriteString("\n\n(File ready but delivery failed: " + fe.FilePath + ": " + derr.Error() + ")")
+		}
+	}
 	if res != nil && res.Reply != "" {
 		return res.Reply, nil
 	}
 	return reply.String(), nil
+}
+
+// deliverGatewayFile pushes one send_file artifact to the chat that asked
+// for it. Telegram gets a real file message; surfaces without file
+// delivery fall back to naming the path in text (handled by the adapter).
+func (rt *runtimeServices) deliverGatewayFile(ctx context.Context, msg gateway.InboundMessage, path, caption string) error {
+	if rt.gateway == nil {
+		return fmt.Errorf("gateway unavailable")
+	}
+	return rt.gateway.DeliverFile(ctx, msg.Platform, msg.ChannelID, path, caption)
 }
 
 // messageIsRelevant runs a cheap, quiet one-shot classification: does the

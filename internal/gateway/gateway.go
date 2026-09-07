@@ -57,6 +57,12 @@ type Reply struct {
 	ReplyTo string
 	// EditID updates a previously sent message instead of posting a new one.
 	EditID string
+	// FilePath, when set, sends a local file instead of (or besides) text.
+	// Caption overrides Text as the file caption on adapters that support
+	// one; when empty, Text is used. Adapters that cannot send files fall
+	// back to a text reply naming the file.
+	FilePath string
+	Caption  string
 }
 
 // Handler processes an inbound message and streams partial replies.
@@ -302,6 +308,39 @@ func (m *Manager) Status() map[string]bool {
 		out[name] = a.Connected()
 	}
 	return out
+}
+
+// fileFallbackText renders a file send on surfaces without file delivery:
+// the caption plus the workspace path so the person can fetch it elsewhere.
+func fileFallbackText(r Reply) string {
+	var b strings.Builder
+	if c := strings.TrimSpace(firstNonEmpty(r.Caption, r.Text)); c != "" {
+		b.WriteString(c)
+	}
+	if fp := strings.TrimSpace(r.FilePath); fp != "" {
+		if b.Len() > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString("File ready: " + fp)
+	}
+	if b.Len() == 0 {
+		b.WriteString("(no content)")
+	}
+	return b.String()
+}
+
+// DeliverFile sends a local file to "platform:channel". Adapters that
+// support files deliver it natively (Telegram: photo/video/document);
+// others fall back to a text reply naming the path.
+func (m *Manager) DeliverFile(ctx context.Context, platform, channel, path, caption string) error {
+	m.mu.RLock()
+	a, exists := m.adapters[platform]
+	m.mu.RUnlock()
+	if !exists {
+		return fmt.Errorf("platform %q is not connected", platform)
+	}
+	_, err := a.Send(ctx, Reply{ChannelID: channel, FilePath: path, Caption: caption})
+	return err
 }
 
 // Deliver sends text to "platform:channel", used by the cron scheduler.

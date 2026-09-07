@@ -30,6 +30,7 @@ func init() {
 		speakTool{},
 		transcribeTool{},
 		boardTool{},
+		sendFileTool{},
 		projectInfoTool{},
 		setSoulTool{},
 		computerTool{},

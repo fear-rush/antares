@@ -175,6 +175,10 @@ func (m *Matrix) dispatch(ctx context.Context, mx mxMessage) {
 // Send posts a message to a room. Matrix has no cheap edit, so EditID is
 // ignored and a new message is sent.
 func (m *Matrix) Send(ctx context.Context, r Reply) (string, error) {
+	if strings.TrimSpace(r.FilePath) != "" {
+		r.Text = fileFallbackText(r)
+	}
+
 	m.mu.Lock()
 	m.txn++
 	txn := m.txn

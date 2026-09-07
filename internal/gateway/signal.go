@@ -164,6 +164,10 @@ func (s *Signal) dispatch(ctx context.Context, m sigMessage) {
 
 // Send posts a message to a recipient or group.
 func (s *Signal) Send(ctx context.Context, r Reply) (string, error) {
+	if strings.TrimSpace(r.FilePath) != "" {
+		r.Text = fileFallbackText(r)
+	}
+
 	body := map[string]any{"message": r.Text, "number": s.cfg.Number}
 	if strings.HasPrefix(r.ChannelID, "group.") {
 		body["recipients"] = []string{strings.TrimPrefix(r.ChannelID, "group.")}

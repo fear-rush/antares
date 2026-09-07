@@ -117,6 +117,9 @@ help them now — do not block them.
 		if hasTool(active, "write_file") {
 			b.WriteString("- File creation is complete only after write_file returns a successful result. A filename in the request, planned arguments, a diff preview, or the user's statement that a file was created is not evidence that it exists. Never turn any of those into your own confirmation. If asked whether a file exists, where it was written, or what it contains without a successful write_file result in this run, check it with read_file first and report the real result. Do not retry the same failed write; explain its actionable error or use a genuinely different valid path/content.\n")
 		}
+		if hasTool(active, "send_file") {
+			b.WriteString("- A file reaches the person only through the send_file tool: creating it (write_file, terminal, image_generate) is not delivering it. Whenever the user asked for a file, or you produced one they need (report PDF, chart, clip, archive), call send_file with its path before finishing — one call per file. On gateway chats the file arrives as a real attachment; elsewhere the reply names its path. Never claim a file was sent without a successful send_file result.\n")
+		}
 		if hasTool(active, "vps_upload") || hasTool(active, "vps_download") || hasTool(active, "vps_run") {
 			// Without this, models fall back to terminal rsync/scp and never use
 			// the saved-host SFTP tools (credentials and TOFU stay unused).

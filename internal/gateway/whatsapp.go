@@ -159,6 +159,10 @@ func (w *WhatsApp) dispatch(ctx context.Context, m waMessage) {
 
 // Send posts a text message through the Graph API.
 func (w *WhatsApp) Send(ctx context.Context, r Reply) (string, error) {
+	if strings.TrimSpace(r.FilePath) != "" {
+		r.Text = fileFallbackText(r)
+	}
+
 	body := map[string]any{
 		"messaging_product": "whatsapp",
 		"to":                r.ChannelID,

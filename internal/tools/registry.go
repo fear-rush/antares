@@ -255,15 +255,15 @@ var Toolsets = map[string][]string{
 	// "default"), and Resolve special-cases it to also skip the otherwise
 	// opt-out MCP tools, so "no tools" really means none.
 	"none":    {},
-	"minimal": {"read_file", "list_files", "grep", "todo"},
+	"minimal": {"read_file", "list_files", "grep", "todo", "send_file"},
 	"coding": {
 		"read_file", "read_document", "write_file", "edit_file", "list_files", "glob", "grep",
-		"terminal", "process", "todo", "board", "project_info", "set_soul", "skill", "delegate_task", "task", "list_roles", "diagnostics", "http_request", "ask_user", "schedule",
+		"terminal", "process", "todo", "board", "project_info", "send_file", "set_soul", "skill", "delegate_task", "task", "list_roles", "diagnostics", "http_request", "ask_user", "schedule",
 	},
 	"research": {
 		"read_file", "read_document", "web_search", "web_fetch", "http_request", "browser", "grep", "todo", "memory",
 		"session_search", "rag_search", "skill", "view_image", "report_finding", "add_intel", "methodology_status",
-		"delegate_task", "task", "list_roles",
+		"delegate_task", "task", "list_roles", "send_file",
 	},
 	"browser": {"browser", "web_search", "web_fetch", "http_request", "read_file", "write_file", "todo", "report_finding", "add_intel", "methodology_status"},
 	"security": {
@@ -295,12 +295,12 @@ var Toolsets = map[string][]string{
 	"social": {
 		"read_file", "write_file", "edit_file", "list_files", "glob", "grep",
 		"terminal", "process", "web_search", "web_fetch", "http_request", "browser",
-		"todo", "memory", "skill", "delegate_task", "task", "list_roles",
+		"todo", "memory", "skill", "delegate_task", "task", "list_roles", "send_file",
 		"email_read", "temp_mail", "social_browser", "social_account", "ask_user", "schedule", "rag_search", "rag_index",
 	},
 	"default": {
 		"read_file", "read_document", "write_file", "edit_file", "list_files", "glob", "grep",
-		"terminal", "process", "web_search", "web_fetch", "http_request", "browser", "todo", "board", "project_info", "set_soul", "memory", "list_proxies", "vps_run", "vps_upload", "vps_download",
+		"terminal", "process", "web_search", "web_fetch", "http_request", "browser", "todo", "board", "project_info", "send_file", "set_soul", "memory", "list_proxies", "vps_run", "vps_upload", "vps_download",
 		"session_search", "rag_search", "rag_index", "skill", "delegate_task", "task", "list_roles", "image_generate", "view_image", "speak", "transcribe", "computer", "diagnostics", "ask_user", "schedule",
 		"osint_dns", "osint_dorks", "osint_whois", "osint_ip", "osint_username", "osint_github", "osint_email", "osint_email_full", "osint_breach", "osint_shodan", "osint_reputation", "osint_crypto", "osint_domain", "osint_phone", "osint_scrape", "osint_paste", "osint_footprint", "osint_pivot", "osint_google", "osint_dorks_live", "check_dependencies", "re_info", "re_strings", "re_analyze", "re_decompile", "solve_captcha", "intercept",
 		"email_read", "temp_mail", "social_browser", "social_account",

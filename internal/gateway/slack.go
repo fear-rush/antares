@@ -198,6 +198,10 @@ func (s *Slack) dispatch(ctx context.Context, payload json.RawMessage) {
 // Send posts a new message, or edits one when EditID is set. It returns the
 // message ts.
 func (s *Slack) Send(ctx context.Context, r Reply) (string, error) {
+	if strings.TrimSpace(r.FilePath) != "" {
+		r.Text = fileFallbackText(r)
+	}
+
 	method := "chat.postMessage"
 	body := map[string]any{"channel": r.ChannelID, "text": r.Text}
 	if r.EditID != "" {

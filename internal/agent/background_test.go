@@ -104,3 +104,34 @@ func TestContinueFinishedWithoutSession(t *testing.T) {
 		t.Fatal("a task with no session cannot be continued")
 	}
 }
+
+func TestRecordProgressTracksTool(t *testing.T) {
+	a := &Agent{bg: newBGManager()}
+	insert(a.bg, "task_p", "researcher", "do research")
+	a.bg.mu.Lock()
+	subToTask["sub-9"] = "task_p"
+	a.bg.mu.Unlock()
+	defer func() {
+		a.bg.mu.Lock()
+		delete(subToTask, "sub-9")
+		a.bg.mu.Unlock()
+	}()
+	a.recordProgress("sub-9", "web_search", `{"query":"x bank"}`)
+	got, ok := a.BackgroundTask("task_p")
+	if !ok {
+		t.Fatal("task missing")
+	}
+	if got.LastTool != "web_search" || got.ToolCount != 1 {
+		t.Fatalf("progress not tracked: %+v", got)
+	}
+	a.recordProgress("sub-9", "http_request", `{"url":"https://x.test/"}`)
+	got, _ = a.BackgroundTask("task_p")
+	if got.ToolCount != 2 || got.LastTool != "http_request" {
+		t.Fatalf("second call not tracked: %+v", got)
+	}
+}
+
+func TestRecordProgressUnknownSubIgnored(t *testing.T) {
+	a := &Agent{bg: newBGManager()}
+	a.recordProgress("sub-nope", "web_search", `{}`) // must not panic
+}

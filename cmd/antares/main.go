@@ -604,7 +604,26 @@ func (rt *runtimeServices) handleGatewayMessage(ctx context.Context, msg gateway
 		req.Toolset = binding.Toolset
 		req.SystemExtra = strings.TrimSpace(binding.PromptPrefix)
 	}
+	// Live background-task progress: while workers run, refresh the
+	// placeholder with one status line per task (Opsi A). Ticks every 2s,
+	// stops when the turn ends. The turn's own tool lines keep flowing
+	// through partial() as before; this only adds the worker table.
+	// replyMu guards the answer text: Run appends on the turn goroutine
+	// while the ticker reads it.
+	var replyMu sync.Mutex
+	// safePartial forwards to the adapter; callers must hold replyMu.
+	// (The emit func below holds it across the whole switch; the ticker
+	// takes it only to snapshot the answer text.)
+	safePartial := partial
+	progressDone := make(chan struct{})
+	var progressWg sync.WaitGroup
+	if safePartial != nil {
+		progressWg.Add(1)
+		go rt.streamTaskProgress(progressDone, &progressWg, sessionID, safePartial, &reply, &replyMu)
+	}
 	res, err := rt.agent.Run(ctx, req, func(e agent.Event) error {
+		replyMu.Lock()
+		defer replyMu.Unlock()
 		switch e.Type {
 		case agent.EventSession:
 			if e.ID != "" && e.ID != sessionID {
@@ -613,34 +632,34 @@ func (rt *runtimeServices) handleGatewayMessage(ctx context.Context, msg gateway
 			}
 		case agent.EventText:
 			reply.WriteString(e.Delta)
-			if partial != nil {
-				partial(gatewayProgressLive(reply.String()))
+			if safePartial != nil {
+				safePartial(gatewayProgressLive(reply.String()))
 			}
 		case agent.EventTurn:
-			if partial != nil && e.Turn > 1 {
-				partial(gatewayProgress(reply.String(), "⏭️ turn "+itoa(e.Turn)))
+			if safePartial != nil && e.Turn > 1 {
+				safePartial(gatewayProgress(reply.String(), "⏭️ turn "+itoa(e.Turn)))
 			}
 		case agent.EventToolCall:
 			// Surface tool activity on the gateway: a long task that only
 			// streams text looks dead while it reads files, runs shell
 			// commands, or fans out to sub-agents. Render the call as a
 			// readable line (icon plus key argument), not raw JSON.
-			if partial != nil {
+			if safePartial != nil {
 				line := toolLine(e.Name, e.Arguments)
 				setLastStatus(line)
-				partial(gatewayProgress(reply.String(), line))
+				safePartial(gatewayProgress(reply.String(), line))
 			}
 		case agent.EventToolProgress:
-			if partial != nil && strings.TrimSpace(e.Message) != "" {
+			if safePartial != nil && strings.TrimSpace(e.Message) != "" {
 				line := toolIcon(e.Name) + " " + e.Name + ": " + truncateStatus(lastLine(e.Message))
 				setLastStatus(line)
-				partial(gatewayProgress(reply.String(), line))
+				safePartial(gatewayProgress(reply.String(), line))
 			}
 		case agent.EventNotice:
-			if partial != nil && strings.TrimSpace(e.Message) != "" {
+			if safePartial != nil && strings.TrimSpace(e.Message) != "" {
 				line := "📌 " + lastLine(e.Message)
 				setLastStatus(line)
-				partial(gatewayProgress(reply.String(), line))
+				safePartial(gatewayProgress(reply.String(), line))
 			}
 		case agent.EventAsk:
 			// A parked ask on a gateway turn means the model is blocked with
@@ -659,6 +678,8 @@ func (rt *runtimeServices) handleGatewayMessage(ctx context.Context, msg gateway
 		}
 		return nil
 	})
+	close(progressDone)
+	progressWg.Wait()
 	if err != nil {
 		return "", err
 	}
@@ -682,6 +703,105 @@ func (rt *runtimeServices) handleGatewayMessage(ctx context.Context, msg gateway
 		return res.Reply, nil
 	}
 	return reply.String(), nil
+}
+
+// streamTaskProgress refreshes the gateway placeholder with one status line
+// per background task until done closes. Runs on its own goroutine; every
+// tick renders the calling session's tasks and pushes them through partial.
+// Throttled to one edit per 2s — Telegram rate-limits edits and the adapter
+// already drops sub-second repeats.
+func (rt *runtimeServices) streamTaskProgress(done <-chan struct{}, wg *sync.WaitGroup, sessionID string, partial func(string), reply *strings.Builder, mu *sync.Mutex) {
+	defer wg.Done()
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			tasks := rt.agent.BackgroundTasksScoped()
+			var mine []agent.BackgroundTask
+			for _, t := range tasks {
+				if sessionID == "" || t.ParentSession == sessionID {
+					mine = append(mine, t)
+				}
+			}
+			if len(mine) == 0 {
+				continue
+			}
+			mu.Lock()
+			body := renderTaskProgress(reply.String(), mine)
+			mu.Unlock()
+			partial(body)
+		}
+	}
+}
+
+// renderTaskProgress builds the placeholder body: kept answer text plus one
+// line per worker — what tool it runs, on what, how many calls so far, and
+// how long. Blocked and finished states surface instead of going quiet.
+func renderTaskProgress(answer string, tasks []agent.BackgroundTask) string {
+	var b strings.Builder
+	if strings.TrimSpace(answer) != "" {
+		b.WriteString(strings.TrimSpace(answer))
+		b.WriteString("\n\n")
+	}
+	b.WriteString("Workers:\n")
+	for _, t := range tasks {
+		short := t.ID
+		if len(short) > 12 {
+			short = short[:12]
+		}
+		state := t.Status
+		detail := taskDetailLine(t)
+		elapsed := ""
+		if !t.StartedAt.IsZero() {
+			elapsed = " · " + ageString(time.Since(t.StartedAt))
+		}
+		if t.WaitingAsk != "" {
+			state = "waiting on your answer"
+			detail = ""
+		}
+		line := "• " + short + " " + state
+		if detail != "" {
+			line += " — " + detail
+		}
+		line += elapsed + "\n"
+		b.WriteString(line)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// taskDetailLine renders what one worker is doing: its current tool plus the
+// interesting argument (URL, query, path), and its call count.
+func taskDetailLine(t agent.BackgroundTask) string {
+	tool := strings.TrimSpace(t.LastTool)
+	if tool == "" {
+		if t.Status == "running" {
+			return "starting…"
+		}
+		return ""
+	}
+	detail := summarizeArgs(tool, t.LastDetail)
+	line := toolIcon(tool) + " " + tool
+	if detail != "" {
+		line += " " + detail
+	}
+	if t.ToolCount > 0 {
+		line += " (#" + itoa(t.ToolCount) + ")"
+	}
+	return line
+}
+
+// ageString renders a duration as 12s / 3m / 2h5m for progress lines.
+func ageString(d time.Duration) string {
+	if d < time.Minute {
+		return itoa(int(d.Seconds())) + "s"
+	}
+	if d < time.Hour {
+		return itoa(int(d.Minutes())) + "m"
+	}
+	return itoa(int(d.Hours())) + "h" + itoa(int(d.Minutes())%60) + "m"
 }
 
 // deliverGatewayFile pushes one send_file artifact to the chat that asked

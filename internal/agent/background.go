@@ -24,6 +24,12 @@ type bgTask struct {
 	depth         int
 	userID        string
 	waitingAsk    string // ask id the finished worker is blocked on, if any
+	// live status: what the worker is doing right now, for gateway progress.
+	mu         sync.Mutex
+	lastTool   string
+	lastDetail string
+	toolCount  int
+	updatedAt  time.Time
 }
 
 // BackgroundDone is the signal a finished background sub-agent sends back to the
@@ -90,9 +96,18 @@ func (a *Agent) startBackground(parent Request, req tools.SubAgentRequest) strin
 
 	subID, untrack := trackSubAgent(req.Role, req.Prompt, parent.SessionID)
 
+	a.bg.mu.Lock()
+	subToTask[subID] = id
+	a.bg.mu.Unlock()
+
 	go func() {
 		defer cancel()
 		defer untrack()
+		defer func() {
+			a.bg.mu.Lock()
+			delete(subToTask, subID)
+			a.bg.mu.Unlock()
+		}()
 
 		maxTurns := req.MaxTurns
 		if maxTurns <= 0 {
@@ -103,6 +118,14 @@ func (a *Agent) startBackground(parent Request, req tools.SubAgentRequest) strin
 		// Not Quiet: the sub-agent keeps a real session, so the task can be
 		// continued later with the task tool's send action. Every event is
 		// mirrored onto the sub-agent's stream so the dashboard can watch it live.
+		// Tool calls also update the task's live status so gateway progress
+		// (Telegram placeholder edits) can show what each worker is doing.
+		progressEmit := subEmit(subID, func(e Event) error {
+			if e.Type == EventToolCall {
+				a.recordProgress(subID, e.Name, e.Arguments)
+			}
+			return nil
+		})
 		res, err := a.Run(ctx, Request{
 			Message:     req.Prompt,
 			SystemExtra: req.SystemExtra,
@@ -115,7 +138,7 @@ func (a *Agent) startBackground(parent Request, req tools.SubAgentRequest) strin
 			Platform:    "background",
 			UserID:      parent.UserID,
 			Depth:       depth,
-		}, subEmit(subID, nil))
+		}, progressEmit)
 		if wt != nil {
 			wt.Cleanup(ctx)
 		}
@@ -153,6 +176,30 @@ func (a *Agent) signalBackgroundDone(id string) {
 		Err:           t.info.Error,
 	})
 }
+
+// recordProgress notes what a background worker just did, for gateway
+// progress rendering. Cheap: a short string copy under a per-task lock.
+func (a *Agent) recordProgress(subID, tool, detail string) {
+	a.bg.mu.Lock()
+	sid, ok := subToTask[subID]
+	var t *bgTask
+	if ok {
+		t = a.bg.tasks[sid]
+	}
+	a.bg.mu.Unlock()
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	t.lastTool = tool
+	t.lastDetail = detail
+	t.toolCount++
+	t.updatedAt = time.Now()
+	t.mu.Unlock()
+}
+
+// subToTask maps a live sub-agent stream id to its background task id.
+var subToTask = map[string]string{}
 
 // RegisterWaitingAsk marks a finished task as blocked on an ask_user question
 // from the resumed turn, so /tasks and /agents show where the work is parked
@@ -314,18 +361,36 @@ type BackgroundTask struct {
 	tools.TaskInfo
 	ParentSession string
 	WaitingAsk    string
+	LastTool      string
+	LastDetail    string
+	ToolCount     int
+	UpdatedAt     time.Time
 }
 
 // BackgroundTasksFor lists every task for the swarm/status views.
 func (a *Agent) BackgroundTasks() []tools.TaskInfo { return a.bg.list("") }
 
 // BackgroundTasksScoped lists background tasks with their parent session.
+func (a *Agent) snapshotTask(t *bgTask) BackgroundTask {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return BackgroundTask{
+		TaskInfo: t.info, ParentSession: t.parentSession, WaitingAsk: t.waitingAsk,
+		LastTool: t.lastTool, LastDetail: t.lastDetail,
+		ToolCount: t.toolCount, UpdatedAt: t.updatedAt,
+	}
+}
+
 func (a *Agent) BackgroundTasksScoped() []BackgroundTask {
 	a.bg.mu.Lock()
-	defer a.bg.mu.Unlock()
-	out := make([]BackgroundTask, 0, len(a.bg.tasks))
+	tasks := make([]*bgTask, 0, len(a.bg.tasks))
 	for _, t := range a.bg.tasks {
-		out = append(out, BackgroundTask{TaskInfo: t.info, ParentSession: t.parentSession, WaitingAsk: t.waitingAsk})
+		tasks = append(tasks, t)
+	}
+	a.bg.mu.Unlock()
+	out := make([]BackgroundTask, 0, len(tasks))
+	for _, t := range tasks {
+		out = append(out, a.snapshotTask(t))
 	}
 	sortTasksByStartInfos(out)
 	return out
@@ -334,12 +399,12 @@ func (a *Agent) BackgroundTasksScoped() []BackgroundTask {
 // BackgroundTask finds one task by id.
 func (a *Agent) BackgroundTask(id string) (BackgroundTask, bool) {
 	a.bg.mu.Lock()
-	defer a.bg.mu.Unlock()
 	t, ok := a.bg.tasks[id]
+	a.bg.mu.Unlock()
 	if !ok {
 		return BackgroundTask{}, false
 	}
-	return BackgroundTask{TaskInfo: t.info, ParentSession: t.parentSession, WaitingAsk: t.waitingAsk}, true
+	return a.snapshotTask(t), true
 }
 
 func truncTask(s string) string {

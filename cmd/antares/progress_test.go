@@ -53,3 +53,33 @@ func TestTaskDetailLineEmpty(t *testing.T) {
 		t.Fatalf("done with no tool should be empty, got %q", got)
 	}
 }
+
+func TestStepBodyTrimsToLastLine(t *testing.T) {
+	got := stepBody("http_request", "line one\nline two\nlast line", false)
+	if got != "last line" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestStepBodyErrorKeptWhole(t *testing.T) {
+	got := stepBody("terminal", "exit 1: boom", true)
+	if got != "exit 1: boom" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestIsSilentStepTool(t *testing.T) {
+	if !isSilentStepTool("ask_user") || !isSilentStepTool("send_file") {
+		t.Fatal("ask/send must be silent")
+	}
+	if isSilentStepTool("terminal") || isSilentStepTool("delegate_task") {
+		t.Fatal("work tools must narrate")
+	}
+}
+
+func TestStepTitleHasTool(t *testing.T) {
+	got := stepTitle("terminal", `{"command":"cd /tmp/x && make"}`)
+	if !strings.Contains(got, "terminal") || !strings.Contains(got, "cd /tmp/x") {
+		t.Fatalf("got %q", got)
+	}
+}

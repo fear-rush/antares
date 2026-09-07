@@ -321,6 +321,37 @@ func (t *Telegram) handleMessage(ctx context.Context, m tgMessage) {
 		_, _ = t.sendRendered(ctx, Reply{ChannelID: chatID, Text: truncateTG(s) + " ▌", EditID: placeholderID}, nil)
 	}
 
+	// Step bubbles: every finished tool call posts its own message while
+	// the turn runs, so the person sees each step instead of one streamed
+	// line that vanishes into the final reply. Replies to the trigger keep
+	// the thread; follow-ups are plain bubbles.
+	stepReplyTo := msg.MessageID
+	var stepMu sync.Mutex
+	step := func(st Step) {
+		title := strings.TrimSpace(st.Title)
+		body := strings.TrimSpace(st.Body)
+		if title == "" && body == "" {
+			return
+		}
+		text := title
+		if body != "" {
+			text += "\n" + body
+		}
+		stepMu.Lock()
+		to := stepReplyTo
+		stepReplyTo = ""
+		stepMu.Unlock()
+		for _, chunk := range splitMarkdownSafe(text, telegramLimit) {
+			id, err := t.sendRich(ctx, chatID, chunk, to)
+			if err != nil {
+				slog.Warn("telegram: step send failed", "error", err)
+				return
+			}
+			to = ""
+			_ = id
+		}
+	}
+	ctx = WithStep(ctx, step)
 	reply, runErr := t.mgr.handle(ctx, msg, partial)
 	if runErr != nil {
 		reply = "⚠️ " + runErr.Error()

@@ -120,9 +120,16 @@ func (a *Agent) startBackground(parent Request, req tools.SubAgentRequest) strin
 		// mirrored onto the sub-agent's stream so the dashboard can watch it live.
 		// Tool calls also update the task's live status so gateway progress
 		// (Telegram placeholder edits) can show what each worker is doing.
+		workerArgs := map[string]string{}
 		progressEmit := subEmit(subID, func(e Event) error {
 			if e.Type == EventToolCall {
 				a.recordProgress(subID, e.Name, e.Arguments)
+				workerArgs[e.ID] = e.Arguments
+			}
+			if e.Type == EventToolResult {
+				args := workerArgs[e.ID]
+				delete(workerArgs, e.ID)
+				emitWorkerStep(id, e.Name, args, e.Content, e.IsError)
 			}
 			return nil
 		})
@@ -175,6 +182,44 @@ func (a *Agent) signalBackgroundDone(id string) {
 		Output:        t.info.Output,
 		Err:           t.info.Error,
 	})
+}
+
+// progressListener fans out one callback per finished worker tool call to
+// every attached gateway turn. Turns attach for their own lifetime and
+// detach at the end; each callback filters by its own session, so two
+// concurrent chats never narrate each other's workers.
+var progressListener = struct {
+	mu  sync.Mutex
+	fns map[int]func(taskID, tool, args, content string, isError bool)
+	seq int
+}{fns: map[int]func(taskID, tool, args, content string, isError bool){}}
+
+// SetProgressListener attaches a per-tool worker callback and returns a
+// detach func the turn calls when it ends. Exported for the gateway turn
+// handler.
+func SetProgressListener(fn func(taskID, tool, args, content string, isError bool)) func() {
+	progressListener.mu.Lock()
+	progressListener.seq++
+	id := progressListener.seq
+	progressListener.fns[id] = fn
+	progressListener.mu.Unlock()
+	return func() {
+		progressListener.mu.Lock()
+		delete(progressListener.fns, id)
+		progressListener.mu.Unlock()
+	}
+}
+
+func emitWorkerStep(taskID, tool, args, content string, isError bool) {
+	progressListener.mu.Lock()
+	fns := make([]func(string, string, string, string, bool), 0, len(progressListener.fns))
+	for _, fn := range progressListener.fns {
+		fns = append(fns, fn)
+	}
+	progressListener.mu.Unlock()
+	for _, fn := range fns {
+		fn(taskID, tool, args, content, isError)
+	}
 }
 
 // recordProgress notes what a background worker just did, for gateway

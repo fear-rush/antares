@@ -621,6 +621,37 @@ func (rt *runtimeServices) handleGatewayMessage(ctx context.Context, msg gateway
 		progressWg.Add(1)
 		go rt.streamTaskProgress(progressDone, &progressWg, sessionID, safePartial, &reply, &replyMu)
 	}
+	step := gateway.StepFunc(ctx)
+	pendingCalls := map[string]string{}
+	var pendingSteps []gateway.Step
+	// Worker steps: each finished background-tool call becomes a bubble
+	// tagged with its task, so parallel workers narrate themselves instead
+	// of going quiet behind the placeholder table.
+	if step != nil {
+		mySession := sessionID
+		detachSteps := agent.SetProgressListener(func(taskID, tool, args, content string, isError bool) {
+			if isSilentStepTool(tool) {
+				return
+			}
+			// Only narrate workers spawned by this chat, not another
+			// session's. ParentSession is checked via the task table.
+			if !rt.taskBelongsTo(taskID, mySession, sessionID) {
+				return
+			}
+			short := taskID
+			if len(short) > 12 {
+				short = short[:12]
+			}
+			// No turn lock here: this runs on the worker's goroutine and
+			// touches no shared turn state. step() does network IO; holding
+			// replyMu across it would stall the turn.
+			step(gateway.Step{
+				Title: "[" + short + "] " + stepTitle(tool, args),
+				Body:  stepBody(tool, content, isError),
+			})
+		})
+		defer detachSteps()
+	}
 	res, err := rt.agent.Run(ctx, req, func(e agent.Event) error {
 		replyMu.Lock()
 		defer replyMu.Unlock()
@@ -644,6 +675,7 @@ func (rt *runtimeServices) handleGatewayMessage(ctx context.Context, msg gateway
 			// streams text looks dead while it reads files, runs shell
 			// commands, or fans out to sub-agents. Render the call as a
 			// readable line (icon plus key argument), not raw JSON.
+			pendingCalls[e.ID] = e.Arguments
 			if safePartial != nil {
 				line := toolLine(e.Name, e.Arguments)
 				setLastStatus(line)
@@ -654,6 +686,21 @@ func (rt *runtimeServices) handleGatewayMessage(ctx context.Context, msg gateway
 				line := toolIcon(e.Name) + " " + e.Name + ": " + truncateStatus(lastLine(e.Message))
 				setLastStatus(line)
 				safePartial(gatewayProgress(reply.String(), line))
+			}
+		case agent.EventToolResult:
+			// One finished tool call = one step bubble: title names the
+			// tool plus its key argument, body carries the outcome (or
+			// the error). delegate_task on the parent turn only announces
+			// the spawn — worker detail streams from the worker table.
+			// Network IO happens after the switch unlocks (see below)
+			// so a slow send never blocks the turn.
+			args := pendingCalls[e.ID]
+			delete(pendingCalls, e.ID)
+			if step != nil && !isSilentStepTool(e.Name) {
+				pendingSteps = append(pendingSteps, gateway.Step{
+					Title: stepTitle(e.Name, args),
+					Body:  stepBody(e.Name, e.Content, e.IsError),
+				})
 			}
 		case agent.EventNotice:
 			if safePartial != nil && strings.TrimSpace(e.Message) != "" {
@@ -675,6 +722,19 @@ func (rt *runtimeServices) handleGatewayMessage(ctx context.Context, msg gateway
 			if strings.TrimSpace(e.FilePath) != "" {
 				pendingFiles = append(pendingFiles, e)
 			}
+		}
+		// Ship step bubbles outside the turn lock: the closure holds
+		// replyMu via defer, so copy the queue, release, send, reacquire.
+		steps := pendingSteps
+		pendingSteps = nil
+		if len(steps) > 0 {
+			replyMu.Unlock()
+			for _, st := range steps {
+				if step != nil {
+					step(st)
+				}
+			}
+			replyMu.Lock()
 		}
 		return nil
 	})
@@ -802,6 +862,71 @@ func ageString(d time.Duration) string {
 		return itoa(int(d.Minutes())) + "m"
 	}
 	return itoa(int(d.Hours())) + "h" + itoa(int(d.Minutes())%60) + "m"
+}
+
+// isSilentStepTool skips step bubbles for tools whose progress already
+// surfaces elsewhere: ask_user (its own card/flow) and send_file (the file
+// message itself is the bubble).
+func isSilentStepTool(name string) bool {
+	switch name {
+	case "ask_user", "send_file":
+		return true
+	}
+	return false
+}
+
+// stepTitle renders one finished tool call as a one-line step header:
+// icon, tool name, and the key argument (command, path, URL, query).
+func stepTitle(name, args string) string {
+	line := toolLine(name, args)
+	if line == "" {
+		line = toolIcon(name) + " " + name
+	}
+	return line
+}
+
+// stepBody trims a tool outcome to a bubble-sized excerpt: errors in full
+// (short), successes as the last meaningful line.
+func stepBody(name, content string, isError bool) string {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return ""
+	}
+	if isError {
+		return truncateStatus(content)
+	}
+	// Verbose tools (search, fetch, shell) dump pages of output; the bubble
+	// keeps the last line so the person sees the outcome, not the dump.
+	lines := strings.Split(content, "\n")
+	// Skip wrapper fences the agent adds around untrusted output.
+	kept := ""
+	for i := len(lines) - 1; i >= 0; i-- {
+		ln := strings.TrimSpace(lines[i])
+		if ln == "" || strings.HasPrefix(ln, "<untrusted") || strings.HasPrefix(ln, "</untrusted") {
+			continue
+		}
+		kept = ln
+		break
+	}
+	if kept == "" {
+		return ""
+	}
+	return truncateStatus(kept)
+}
+
+// taskBelongsTo reports whether a background task was spawned by this
+// chat's session. mySession is captured at turn start; liveSession tracks
+// the session id if the turn created one mid-flight. Either match counts:
+// a gateway chat owns exactly one session at a time.
+func (rt *runtimeServices) taskBelongsTo(taskID, mySession, liveSession string) bool {
+	t, ok := rt.agent.BackgroundTask(taskID)
+	if !ok {
+		return false
+	}
+	if t.ParentSession == "" {
+		return true
+	}
+	return t.ParentSession == mySession || t.ParentSession == liveSession
 }
 
 // deliverGatewayFile pushes one send_file artifact to the chat that asked

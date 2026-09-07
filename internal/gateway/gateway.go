@@ -65,6 +65,34 @@ type Reply struct {
 	Caption  string
 }
 
+// Step is one finished unit of work (a tool call plus its outcome) sent
+// as its own chat bubble while the turn runs, so the person sees every
+// step instead of one streamed line that vanishes into the final reply.
+type Step struct {
+	// Title is the short readable line, e.g. "terminal — cd /tmp/x && make".
+	Title string
+	// Body is the outcome detail (redirect target, result excerpt, error).
+	// Empty when there is nothing worth a second line.
+	Body string
+}
+
+// stepKey carries a Step func through the context from the adapter to the
+// turn handler. Adapters without step rendering leave it unset.
+type stepKey struct{}
+
+// WithStep attaches a step sender to the context for this turn.
+func WithStep(ctx context.Context, fn func(Step)) context.Context {
+	return context.WithValue(ctx, stepKey{}, fn)
+}
+
+// StepFunc returns the step sender for this turn, or nil.
+func StepFunc(ctx context.Context) func(Step) {
+	if fn, ok := ctx.Value(stepKey{}).(func(Step)); ok {
+		return fn
+	}
+	return nil
+}
+
 // Handler processes an inbound message and streams partial replies.
 // The returned string is the final text.
 type Handler func(ctx context.Context, msg InboundMessage, partial func(string)) (string, error)
@@ -409,6 +437,7 @@ func (m *Manager) handle(ctx context.Context, msg InboundMessage, partial func(s
 	}
 	return m.handler(ctx, msg, partial)
 }
+
 
 func contains(list []string, want string) bool {
 	for _, v := range list {

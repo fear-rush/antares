@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"net/http"
@@ -205,10 +206,16 @@ func (webSearchTool) Execute(ctx context.Context, in Input) Result {
 	case "searxng":
 		results, err = searxngSearch(ctx, cfg.BaseURL, query, args.MaxResults)
 	default:
-		// Default (and legacy "duckduckgo") route through the stealth browser,
-		// which resolves and renders past DNS filters and bot-detection that
-		// block a plain HTTP search client.
+		// Default (and legacy "duckduckgo"): try the browser first (renders
+		// past bot-detection), then plain-HTTP fallbacks that need no API
+		// key and no browser: Bing RSS, then DuckDuckGo HTML.
 		results, err = browserSearch(ctx, in.SessionID, in.Deps.Config, query, args.MaxResults)
+		if err != nil {
+			results, err = bingRSSSearch(ctx, query, args.MaxResults)
+		}
+		if err != nil {
+			results, err = ddgHTMLSearch(ctx, query, args.MaxResults)
+		}
 	}
 	if err != nil {
 		return Errorf("search failed: %v", err)
@@ -310,6 +317,177 @@ func tavilySearch(ctx context.Context, apiKey, q string, n int) ([]searchResult,
 		out = append(out, searchResult{Title: r.Title, URL: r.URL, Snippet: r.Content})
 	}
 	return out, nil
+}
+
+// bingRSSSearch queries Bing's RSS endpoint over plain HTTP: no API key,
+// no browser. The markup is stable and bot-detection rarely blocks it.
+func bingRSSSearch(ctx context.Context, q string, n int) ([]searchResult, error) {
+	u := "https://www.bing.com/search?format=rss&q=" + url.QueryEscape(q)
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+	resp, err := webClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("Bing RSS HTTP %d", resp.StatusCode)
+	}
+	type item struct {
+		Title string `xml:"title"`
+		Link  string `xml:"link"`
+		Desc  string `xml:"description"`
+	}
+	var rss struct {
+		Items []item `xml:"channel>item"`
+	}
+	if err := xml.Unmarshal(body, &rss); err != nil {
+		return nil, fmt.Errorf("could not parse Bing RSS: %w", err)
+	}
+	out := make([]searchResult, 0, n)
+	for _, it := range rss.Items {
+		if len(out) >= n {
+			break
+		}
+		t := strings.TrimSpace(it.Title)
+		if t == "" || strings.HasPrefix(t, "Bing: ") {
+			// First item echoes the query; keep it only if nothing else shows.
+			if len(out) > 0 || t == "" {
+				continue
+			}
+		}
+		out = append(out, searchResult{
+			Title:   htmlToText(t),
+			URL:     strings.TrimSpace(it.Link),
+			Snippet: truncateText(htmlToText(it.Desc), 400),
+		})
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("Bing RSS returned no results")
+	}
+	return out, nil
+}
+
+// ddgHTMLSearch scrapes DuckDuckGo's HTML endpoint over plain HTTP: no API
+// key, no JavaScript. Last resort before giving up.
+func ddgHTMLSearch(ctx context.Context, q string, n int) ([]searchResult, error) {
+	u := "https://html.duckduckgo.com/html/?q=" + url.QueryEscape(q)
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+	resp, err := webClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("DuckDuckGo HTTP %d", resp.StatusCode)
+	}
+	html := string(body)
+	var out []searchResult
+	for _, block := range strings.Split(html, `class="result"`) {
+		if len(out) >= n {
+			break
+		}
+		aIdx := strings.Index(block, "<a ")
+		if aIdx < 0 {
+			continue
+		}
+		href := attrValue(block[aIdx:], "href")
+		if href == "" || strings.HasPrefix(href, "/") && !strings.Contains(href, "uddg=") {
+			if u2 := uddgURL(block[aIdx:]); u2 != "" {
+				href = u2
+			} else {
+				continue
+			}
+		}
+		title := htmlToText(tagText(block[aIdx:], "a"))
+		snip := htmlToText(classText(block, "snippet"))
+		if strings.TrimSpace(title) == "" || strings.TrimSpace(href) == "" {
+			continue
+		}
+		out = append(out, searchResult{Title: title, URL: href, Snippet: truncateText(snip, 400)})
+		if len(out) >= n {
+			break
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("DuckDuckGo returned no results")
+	}
+	return out, nil
+}
+
+// attrValue pulls href="..." out of a tag fragment.
+func attrValue(tag, name string) string {
+	i := strings.Index(tag, name+`="`)
+	if i < 0 {
+		return ""
+	}
+	rest := tag[i+len(name)+2:]
+	if j := strings.IndexByte(rest, '"'); j >= 0 {
+		return rest[:j]
+	}
+	return ""
+}
+
+// uddgURL unwraps DuckDuckGo's redirect (/l/?uddg=<url-encoded>) to the target.
+func uddgURL(tag string) string {
+	i := strings.Index(tag, "uddg=")
+	if i < 0 {
+		return ""
+	}
+	rest := tag[i+len("uddg="):]
+	if j := strings.IndexAny(rest, `"&`); j >= 0 {
+		rest = rest[:j]
+	}
+	if u, err := url.QueryUnescape(rest); err == nil {
+		return u
+	}
+	return rest
+}
+
+// tagText returns the inner text of the first <tag>...</a> in frag.
+func tagText(frag, tag string) string {
+	i := strings.Index(frag, ">")
+	if i < 0 {
+		return ""
+	}
+	j := strings.Index(frag, "</a>")
+	if j < 0 || j < i {
+		return ""
+	}
+	return frag[i+1 : j]
+}
+
+// classText returns the inner text of the first class="name"..."..." block.
+func classText(block, name string) string {
+	i := strings.Index(block, `class="`+name+`"`)
+	if i < 0 {
+		return ""
+	}
+	gt := strings.Index(block[i:], ">")
+	if gt < 0 {
+		return ""
+	}
+	rest := block[i+gt+1:]
+	end := strings.Index(rest, "</")
+	if end < 0 {
+		return ""
+	}
+	return rest[:end]
 }
 
 func searxngSearch(ctx context.Context, base, q string, n int) ([]searchResult, error) {

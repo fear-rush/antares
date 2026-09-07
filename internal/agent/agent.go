@@ -145,6 +145,9 @@ type Request struct {
 	// project into RAG: the folder is indexed into its own collection and that
 	// collection joins auto-context. Persisted in Meta as rag_indexed.
 	IndexRAG bool
+	// Wake optionally marks a ContextInject turn as resuming one background
+	// task, so an ask_user park inside it traces back to that task's row.
+	Wake *WakeTask
 	// ContextInject is background context the agent should act on this turn —
 	// currently a finished sub-agent's result. It is fed to the model as new
 	// input (so the agent resumes and processes it), but it is NOT shown as a
@@ -864,6 +867,19 @@ func (a *Agent) executeTools(
 				writeRoots = append(writeRoots, aw)
 			}
 		}
+		// ask_user blocks the turn until a person answers, which only works
+		// where someone watches the event stream (the dashboard renders the
+		// ask card and POSTs the answer). Everywhere else - gateways, cron,
+		// sub-agents, TUI/CLI - nobody can answer, so leave AskUser nil:
+		// the tool then yields its questions to the model, the turn ends,
+		// and the person's next message carries the answers.
+		askFn := a.askBridge(sess.ID, safeEmit, a.asAskWaiter(req))
+		if req.Wake != nil && req.Wake.TaskID != "" && a.asAskWaiter(req) != nil {
+			taskID := req.Wake.TaskID
+			askFn = func(ctx context.Context, qs []tools.AskQuestion) (string, error) {
+				return a.askAndTrack(ctx, sess.ID, taskID, qs, safeEmit)
+			}
+		}
 		in := tools.Input{
 			Args:       json.RawMessage(call.Arguments),
 			CallID:     call.ID,
@@ -878,7 +894,7 @@ func (a *Agent) executeTools(
 					Chunk: p.Chunk, Message: p.Message,
 				})
 			},
-			AskUser: a.askBridge(sess.ID, safeEmit),
+			AskUser: askFn,
 			Deps: &tools.Deps{
 				Config: a.config(), Store: a.db, RAG: a.rag, Shell: a.shell,
 				Sub: a.subAgentFor(req), Tasks: a.backgroundFor(req), Skills: a.skillLibrary(),

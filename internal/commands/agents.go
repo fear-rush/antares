@@ -38,9 +38,13 @@ func cmdAgents(_ context.Context, d Deps, in Input) (Result, error) {
 			s.ID, s.Role, firstLine(s.Task), age(time.Since(s.StartedAt)))
 	}
 	for _, t := range tasks {
-		if t.Status == "running" {
+		line := t.Status
+		if line == "done" && t.WaitingAsk != "" {
+			line = "done - waiting on your answer"
+		}
+		if t.Status == "running" || t.WaitingAsk != "" {
 			fmt.Fprintf(&b, "- `%s` %s — %s · %s\n",
-				t.ID, orDash(t.Role), firstLine(t.Task), age(time.Since(t.StartedAt)))
+				t.ID, line, orDash(t.Role), firstLine(t.Task))
 		}
 	}
 	done := 0
@@ -70,6 +74,9 @@ func cmdTasks(_ context.Context, d Deps, in Input) (Result, error) {
 		var b strings.Builder
 		fmt.Fprintf(&b, "**Task `%s`** — %s\n\n", t.ID, t.Status)
 		fmt.Fprintf(&b, "- Role: %s\n- Task: %s\n", orDash(t.Role), t.Task)
+		if t.WaitingAsk != "" {
+			fmt.Fprintf(&b, "- Waiting on: your answer\n")
+		}
 		if t.Error != "" {
 			fmt.Fprintf(&b, "- Error: %s\n", t.Error)
 		}
@@ -95,8 +102,12 @@ func cmdTasks(_ context.Context, d Deps, in Input) (Result, error) {
 	var b strings.Builder
 	b.WriteString("**Background tasks**\n\n")
 	for _, t := range tasks {
+		status := t.Status
+		if status == "done" && t.WaitingAsk != "" {
+			status = "done - waiting on your answer"
+		}
 		fmt.Fprintf(&b, "- `%s` %s — %s · %s\n",
-			t.ID, t.Status, orDash(t.Role), firstLine(t.Task))
+			t.ID, status, orDash(t.Role), firstLine(t.Task))
 	}
 	b.WriteString("\nRead one with `/tasks <id>`.")
 	return Result{Output: b.String()}, nil

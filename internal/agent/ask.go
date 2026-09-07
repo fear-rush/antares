@@ -103,13 +103,80 @@ func (a *Agent) askUser(ctx context.Context, sessionID string, qs []AskQuestion,
 	}
 }
 
+// AskWaiter is implemented by surfaces that can park a turn on a human
+// question and resume it when the answer arrives. The web dashboard is one:
+// its SSE stream carries the ask card, and POST /api/asks/{id} resolves it.
+// The TUI and CLI never park: they have no ask card live while a turn
+// streams, so blocking there would freeze with no way to answer. Gateways
+// and cron never park either: their request/response shape has no live card
+// and no resolve endpoint, so the turn would stall forever with the user
+// seeing nothing. Those surfaces get the questions rendered into the reply
+// text so the person's next message carries the answers.
+type AskWaiter interface {
+	WaitForAsk(ctx context.Context, sessionID string, qs []AskQuestion, emit Emit) (string, error)
+}
+
+// WaitForAsk parks the turn on a human question; the answer arrives via
+// POST /api/asks/{id} and the same turn continues.
+func (a *Agent) WaitForAsk(ctx context.Context, sessionID string, qs []AskQuestion, emit Emit) (string, error) {
+	return a.askUser(ctx, sessionID, qs, emit)
+}
+
+// asAskWaiter reports whether a request runs on a surface that can park a
+// turn on a human question and resume it. Only the web dashboard qualifies:
+// its SSE stream carries the ask card and POST /api/asks/{id} resolves it.
+// The TUI and CLI never park: no live ask card renders while a turn
+// streams, so blocking there would freeze with no way to answer. Gateways,
+// cron, and sub-agents never park either: their request/response shape has
+// no live card and no resolve endpoint, and a parked detached turn would
+// silently wedge the wake queue. A parked ask on those surfaces is also what
+// made finished background tasks surface as "(no final answer)" while the
+// real block sat invisible elsewhere. Those surfaces get the questions
+// rendered into the reply text so the person's next message carries the
+// answers.
+func (a *Agent) asAskWaiter(req Request) AskWaiter {
+	if req.Platform == "" || req.Platform == "web" {
+		return a
+	}
+	return nil
+}
+
+// askAndTrack runs a parking ask while marking the resumed background task
+// as waiting, so /tasks and /agents show where the work is parked. The mark
+// clears when the answer arrives or the wait is interrupted.
+// It is only called when the surface parks (web), never on gateways or cron.
+func (a *Agent) askAndTrack(ctx context.Context, sessionID, taskID string, qs []tools.AskQuestion, emit Emit) (string, error) {
+	// Peek the ask id the inner bridge is about to register: it emits the
+	// EventAsk synchronously before blocking, so capture it here.
+	var askID string
+	tracked := func(e Event) error {
+		if e.Type == EventAsk && askID == "" {
+			askID = e.ID
+			a.RegisterWaitingAsk(taskID, e.ID)
+		}
+		if emit != nil {
+			return emit(e)
+		}
+		return nil
+	}
+	bridged := a.askBridge(sessionID, tracked, a)
+	ans, err := bridged(ctx, qs)
+	a.RegisterWaitingAsk(taskID, "")
+	return ans, err
+}
+
 // askBridge adapts askUser to the tools.AskFunc signature, so the ask_user tool
-// can block without importing this package.
-func (a *Agent) askBridge(sessionID string, emit Emit) tools.AskFunc {
+// can block without importing this package. A nil waiter means the surface
+// cannot park on a question: the tool then yields its questions into the
+// reply text so the person's next message carries the answers.
+func (a *Agent) askBridge(sessionID string, emit Emit, waiter AskWaiter) tools.AskFunc {
 	return func(ctx context.Context, qs []tools.AskQuestion) (string, error) {
 		conv := make([]AskQuestion, len(qs))
 		for i, q := range qs {
 			conv[i] = AskQuestion{Question: q.Question, Header: q.Header, Options: q.Options, MultiSelect: q.MultiSelect}
+		}
+		if waiter != nil {
+			return waiter.WaitForAsk(ctx, sessionID, conv, emit)
 		}
 		return a.askUser(ctx, sessionID, conv, emit)
 	}

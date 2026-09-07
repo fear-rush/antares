@@ -641,6 +641,14 @@ func (rt *runtimeServices) handleGatewayMessage(ctx context.Context, msg gateway
 				setLastStatus(line)
 				partial(gatewayProgress(reply.String(), line))
 			}
+		case agent.EventAsk:
+			// A parked ask on a gateway turn means the model is blocked with
+			// nobody able to answer — this is the stall that left finished
+			// background tasks reading as "(no final answer)" while the real
+			// block sat invisible. Surface it loudly so it gets fixed, not
+			// waited on.
+			slog.Warn("gateway turn parked on ask_user with no live card",
+				"platform", msg.Platform, "session", sessionID, "ask", e.ID)
 		}
 		return nil
 	})

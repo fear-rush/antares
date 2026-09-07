@@ -22,12 +22,12 @@ import (
 //     losing the streaming turn's context.
 type wakeQueue struct {
 	mu      sync.Mutex
-	pending map[string][]string // session -> queued result notes
-	running map[string]bool     // session -> a turn is in flight
+	pending map[string][]queuedWake // session -> queued result notes
+	running map[string]bool         // session -> a turn is in flight
 }
 
 func newWakeQueue() *wakeQueue {
-	return &wakeQueue{pending: map[string][]string{}, running: map[string]bool{}}
+	return &wakeQueue{pending: map[string][]queuedWake{}, running: map[string]bool{}}
 }
 
 // formatDone renders a finished sub-agent's outcome as the note that resumes the
@@ -55,34 +55,43 @@ func formatDone(d agent.BackgroundDone) string {
 		"\n\nIncorporate this result into the work. If other sub-agents are still running, keep waiting for them; otherwise continue."
 }
 
+// queuedWake is a finished sub-agent's note plus the task it belongs to,
+// so the resumed turn can trace an ask_user park back to that task's row.
+type queuedWake struct {
+	note   string
+	taskID string
+}
+
 // onBackgroundDone is registered on the agent. It turns a finished sub-agent
 // into either an immediate wake-up turn or a queued follow-up.
 func (s *Server) onBackgroundDone(d agent.BackgroundDone) {
 	if d.ParentSession == "" {
 		return
 	}
-	note := formatDone(d)
+	s.enqueueWake(d.ParentSession, queuedWake{note: formatDone(d), taskID: d.TaskID})
+}
 
+func (s *Server) enqueueWake(session string, w queuedWake) {
 	s.wake.mu.Lock()
 	// If a turn is already running for this session (streaming, or an earlier
 	// wake-up still going), queue the note; the running turn drains it on finish.
-	if s.wake.running[d.ParentSession] {
-		s.wake.pending[d.ParentSession] = append(s.wake.pending[d.ParentSession], note)
+	if s.wake.running[session] {
+		s.wake.pending[session] = append(s.wake.pending[session], w)
 		s.wake.mu.Unlock()
 		return
 	}
 	// Also queue if a live run exists that this queue does not know about (a
 	// user turn started via handleChat). The hub is the source of truth for
 	// "is something streaming right now".
-	if s.hub.get(d.ParentSession) != nil {
-		s.wake.pending[d.ParentSession] = append(s.wake.pending[d.ParentSession], note)
+	if s.hub.get(session) != nil {
+		s.wake.pending[session] = append(s.wake.pending[session], w)
 		s.wake.mu.Unlock()
 		return
 	}
 	s.wake.mu.Unlock()
 
 	// Idle session: wake it with a fresh turn carrying this result.
-	s.startWakeTurn(d.ParentSession, note)
+	s.startWakeTurn(session, w)
 }
 
 // startWakeTurn wakes an idle session: it starts a detached turn that resumes
@@ -91,11 +100,11 @@ func (s *Server) onBackgroundDone(d agent.BackgroundDone) {
 // continues rather than the transcript showing a fake user prompt. Events
 // publish into a liveRun so a reattaching client sees the resumed turn, and any
 // results that queue up while it runs are folded into one more turn.
-func (s *Server) startWakeTurn(session, note string) {
+func (s *Server) startWakeTurn(session string, w queuedWake) {
 	s.wake.mu.Lock()
 	if s.wake.running[session] {
 		// Someone else is driving; just queue.
-		s.wake.pending[session] = append(s.wake.pending[session], note)
+		s.wake.pending[session] = append(s.wake.pending[session], w)
 		s.wake.mu.Unlock()
 		return
 	}
@@ -116,14 +125,14 @@ func (s *Server) startWakeTurn(session, note string) {
 			s.wake.mu.Unlock()
 			// Drain: fold every queued result into one more turn.
 			if len(queued) > 0 {
-				s.startWakeTurn(session, strings.Join(queued, "\n\n---\n\n"))
+				s.startWakeTurn(session, mergeWakes(queued))
 			}
 		}()
-		req := agent.Request{
+		req := agent.WithWakeTask(agent.Request{
 			SessionID:     session,
-			ContextInject: note,
+			ContextInject: w.note,
 			Platform:      "web",
-		}
+		}, w.taskID, session)
 		if _, err := s.agent.Run(context.Background(), req, func(e agent.Event) error {
 			lr.publish(e)
 			return nil
@@ -131,6 +140,23 @@ func (s *Server) startWakeTurn(session, note string) {
 			slog.Debug("wake turn failed", "error", err, "session", session)
 		}
 	}()
+}
+
+// mergeWakes folds queued results into one turn. The first task id wins for
+// ask tracing; every note still reaches the model in order.
+func mergeWakes(queued []queuedWake) queuedWake {
+	notes := make([]string, 0, len(queued))
+	for _, q := range queued {
+		notes = append(notes, q.note)
+	}
+	out := queuedWake{note: strings.Join(notes, "\n\n---\n\n")}
+	for _, q := range queued {
+		if q.taskID != "" {
+			out.taskID = q.taskID
+			break
+		}
+	}
+	return out
 }
 
 // drainAfterTurn is called when a user-driven turn ends. If sub-agent results
@@ -148,7 +174,7 @@ func (s *Server) drainAfterTurn(session string) {
 	if len(queued) == 0 || running {
 		return
 	}
-	s.startWakeTurn(session, strings.Join(queued, "\n\n---\n\n"))
+	s.startWakeTurn(session, mergeWakes(queued))
 }
 
 

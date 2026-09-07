@@ -23,6 +23,7 @@ type bgTask struct {
 	parentSession string // the session that delegated it, to signal on finish
 	depth         int
 	userID        string
+	waitingAsk    string // ask id the finished worker is blocked on, if any
 }
 
 // BackgroundDone is the signal a finished background sub-agent sends back to the
@@ -153,9 +154,32 @@ func (a *Agent) signalBackgroundDone(id string) {
 	})
 }
 
-// OnBackgroundDone registers the callback invoked when a background sub-agent
+// RegisterWaitingAsk marks a finished task as blocked on an ask_user question
+// from the resumed turn, so /tasks and /agents show where the work is parked
+// instead of reporting the task finished while nothing moves. Pass "" to clear.
+func (a *Agent) RegisterWaitingAsk(taskID, askID string) {
+	a.bg.mu.Lock()
+	defer a.bg.mu.Unlock()
+	if t, ok := a.bg.tasks[taskID]; ok {
+		t.waitingAsk = askID
+	}
+}
 // finishes. The server uses it to resume (or wake) the delegating session.
 func (a *Agent) OnBackgroundDone(cb func(BackgroundDone)) { a.onBgDone = cb }
+
+// WakeTask carries the background task a wake/ContextInject turn resumes, so
+// a resumed turn that parks on ask_user can be traced back to the task row
+// the user sees in /tasks and /agents. Empty TaskID for ordinary turns.
+type WakeTask struct {
+	TaskID string
+	Parent string
+}
+
+// WithWakeTask tags req so the resumed turn knows which task it continues.
+func WithWakeTask(req Request, taskID, parent string) Request {
+	req.Wake = &WakeTask{TaskID: taskID, Parent: parent}
+	return req
+}
 
 // continueTask sends a follow-up to a finished task, running another turn on the
 // same sub-session so the coordinator can iterate with a worker. It runs
@@ -284,10 +308,12 @@ func (m *bgManager) stop(id string) bool {
 }
 
 // BackgroundTask is a background task snapshot plus the delegating session,
-// so gateway commands can scope the list to one chat.
+// so gateway commands can scope the list to one chat. WaitingAsk is the id of
+// an ask_user question the resumed turn is blocked on, if any.
 type BackgroundTask struct {
 	tools.TaskInfo
 	ParentSession string
+	WaitingAsk    string
 }
 
 // BackgroundTasksFor lists every task for the swarm/status views.
@@ -299,7 +325,7 @@ func (a *Agent) BackgroundTasksScoped() []BackgroundTask {
 	defer a.bg.mu.Unlock()
 	out := make([]BackgroundTask, 0, len(a.bg.tasks))
 	for _, t := range a.bg.tasks {
-		out = append(out, BackgroundTask{TaskInfo: t.info, ParentSession: t.parentSession})
+		out = append(out, BackgroundTask{TaskInfo: t.info, ParentSession: t.parentSession, WaitingAsk: t.waitingAsk})
 	}
 	sortTasksByStartInfos(out)
 	return out
@@ -313,7 +339,7 @@ func (a *Agent) BackgroundTask(id string) (BackgroundTask, bool) {
 	if !ok {
 		return BackgroundTask{}, false
 	}
-	return BackgroundTask{TaskInfo: t.info, ParentSession: t.parentSession}, true
+	return BackgroundTask{TaskInfo: t.info, ParentSession: t.parentSession, WaitingAsk: t.waitingAsk}, true
 }
 
 func truncTask(s string) string {

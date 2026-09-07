@@ -20,3 +20,37 @@ func TestMergeWakesKeepsTaskID(t *testing.T) {
 }
 
 
+
+func TestMergeWakesKeepsRoute(t *testing.T) {
+	out := mergeWakes([]queuedWake{
+		{note: "a", taskID: "t1", platform: "telegram", channelID: "c1", userID: "u1"},
+		{note: "b", taskID: "t2"},
+	})
+	if out.platform != "telegram" || out.channelID != "c1" || out.userID != "u1" {
+		t.Fatalf("route lost: %+v", out)
+	}
+}
+
+func TestWakeStepBodyTrims(t *testing.T) {
+	if got := wakeStepBody("a\nb\nlast", false); got != "\nlast" {
+		t.Fatalf("got %q", got)
+	}
+	if got := wakeStepBody("boom", true); got != "\nboom" {
+		t.Fatalf("got %q", got)
+	}
+	if wakeStepBody("", false) != "" {
+		t.Fatal("empty must stay empty")
+	}
+}
+
+func TestTruncateRunesAligned(t *testing.T) {
+	got := truncateRunes("done — researcher · x", 10)
+	for _, r := range got {
+		if r == '�' {
+			t.Fatalf("replacement char in %q", got)
+		}
+	}
+	if len([]rune(got)) != 10 {
+		t.Fatalf("want 10 runes, got %q", got)
+	}
+}

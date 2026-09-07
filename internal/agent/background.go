@@ -23,6 +23,8 @@ type bgTask struct {
 	parentSession string // the session that delegated it, to signal on finish
 	depth         int
 	userID        string
+	platform      string // surface that spawned the work, for routing the resume turn
+	channelID     string
 	waitingAsk    string // ask id the finished worker is blocked on, if any
 	// live status: what the worker is doing right now, for gateway progress.
 	mu         sync.Mutex
@@ -34,7 +36,9 @@ type bgTask struct {
 
 // BackgroundDone is the signal a finished background sub-agent sends back to the
 // session that delegated it, so the main agent can be resumed with the result
-// instead of polling for it.
+// instead of polling for it. Platform/ChannelID/UserID route the resume turn
+// back to the surface that spawned the work, so a Telegram chat's workers
+// resume as Telegram turns (with step bubbles) instead of silent web turns.
 type BackgroundDone struct {
 	ParentSession string
 	TaskID        string
@@ -42,6 +46,9 @@ type BackgroundDone struct {
 	Task          string
 	Output        string
 	Err           string
+	Platform      string
+	ChannelID     string
+	UserID        string
 }
 
 // bgManager holds every background task for the process, keyed by id.
@@ -89,6 +96,8 @@ func (a *Agent) startBackground(parent Request, req tools.SubAgentRequest) strin
 		parentSession: parent.SessionID,
 		depth:         depth,
 		userID:        parent.UserID,
+		platform:      parent.Platform,
+		channelID:     parent.ChannelID,
 	}
 	a.bg.mu.Lock()
 	a.bg.tasks[id] = task
@@ -181,6 +190,9 @@ func (a *Agent) signalBackgroundDone(id string) {
 		Task:          t.info.Task,
 		Output:        t.info.Output,
 		Err:           t.info.Error,
+		Platform:      t.platform,
+		ChannelID:     t.channelID,
+		UserID:        t.userID,
 	})
 }
 
